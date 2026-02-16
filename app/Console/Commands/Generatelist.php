@@ -186,4 +186,30 @@ class Generatelist extends Command
         $this->info("CSV file created successfully: {$filepath}");
         $this->info("Total records exported: " . $customerProfessions->count());
     }
+
+    protected function parseDob(?string $dateString): ?string
+    {
+        if (empty($dateString)) {
+            return null;
+        }
+
+        $dateString = trim($dateString);
+
+        // Try to parse DD/MM/YYYY format first
+        if (preg_match('/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/', $dateString, $matches)) {
+            $day = str_pad($matches[1], 2, '0', STR_PAD_LEFT);
+            $month = str_pad($matches[2], 2, '0', STR_PAD_LEFT);
+            $year = $matches[3];
+            $dateString = "{$year}-{$month}-{$day}";
+        }
+
+        // Try to parse using Carbon
+        try {
+            $date = Carbon::parse($dateString);
+
+            return $date->format('Y-m-d');
+        } catch (\Exception $e) {
+            return null;
+        }
+    }
 }

@@ -15,7 +15,8 @@ class Customerprofession extends Model
     {
         return $this->belongsTo(Profession::class, 'ProfessionId', 'Id');
     }
-    public function customerapplications(){
+    public function customerapplications()
+    {
         return $this->hasMany(Customerapplication::class, 'CustomerProfessionId', 'Id')->where('ApprovalStatus', 'APPROVED');
     }
 }

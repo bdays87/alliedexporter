@@ -32,4 +32,9 @@ class Customer extends Model
     {
         return $this->hasOne(City::class, 'Id', 'CityId');
     }
+
+    public function registrations()
+    {
+        return $this->hasMany(Registration::class, 'CustomerId', 'Id');
+    }
 }
