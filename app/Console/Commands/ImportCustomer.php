@@ -90,7 +90,7 @@ class ImportCustomer extends Command
                 }
                 $user = new Newuser();
                 $user->uuid = Str::uuid()->toString();
-                $user->accounttype_id = $customer->CustomerTypeId;
+                $user->accounttype_id = 2;
                 $user->name = $customer->FirstName;
                 $user->surname = $customer->LastName;
                 $user->email = filter_var($customer->User->Email, FILTER_VALIDATE_EMAIL) ? $customer->User->Email : $customer->Email ?? $regnumber . $name . '@example.com';
