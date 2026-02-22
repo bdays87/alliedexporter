@@ -59,7 +59,7 @@ class ImportCustomerprofession extends Command
                 $tire_id = 1;
                 $uuid = Str::uuid()->toString();
                 $employmentsector = "PUBLIC";
-                $status = $registration ? $registration->Status : "PENDING";
+                $status = "APPROVED";
                 $year =  $registration ? Carbon::parse($registration->RegistrationDate)->year : null;
                 $newcustomerprofession = new Newcustomerprofession();
                 $newcustomerprofession->id = $id;
@@ -75,6 +75,15 @@ class ImportCustomerprofession extends Command
                 $newcustomerprofession->employmentsector = $employmentsector;
                 $newcustomerprofession->status = $status;
                 $newcustomerprofession->year = $year;
+
+                // Handle C# DateTimeOffset format and convert to Laravel timestamp
+            $dateCreated = $this->parseDateTimeOffset($customerprofession->DateCreated);
+            // If DateCreated is DateTime.MinValue, try to use DateUpdated instead
+            if (! $dateCreated) {
+                $dateCreated = $this->parseDateTimeOffset($customerprofession->DateUpdated);
+            }
+            $newcustomerprofession->created_at = $dateCreated ?? now();
+            $newcustomerprofession->updated_at = $this->parseDateTimeOffset($customerprofession->DateUpdated);
                 $newcustomerprofession->save();
                 $counter++;
             } else {
@@ -84,4 +93,99 @@ class ImportCustomerprofession extends Command
         }
         $this->info('Total Imported Customer Profession: ' . $counter);
     }
+
+
+
+
+
+
+
+   protected function parseDate($dateString)
+    {
+        if (! $dateString) {
+            return null;
+        }
+        $dateString = trim($dateString);
+
+        if ($dateString == '0001-01-01' || $dateString == '0001-01-01 00:00:00') {
+            return null;
+        }
+
+        if (preg_match('/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/', $dateString, $m)) {
+            return "{$m[3]}-".str_pad($m[2], 2, '0', STR_PAD_LEFT).'-'.str_pad($m[1], 2, '0', STR_PAD_LEFT);
+        }
+
+        try {
+            return Carbon::parse($dateString)->format('Y-m-d');
+        } catch (\Exception $e) {
+            return null;
+        }
+    }
+
+    // ✅ Clean C# DateTime.MinValue
+    protected function cleanDate($date)
+    {
+        if (! $date) {
+            return null;
+        }
+
+        $date = trim((string) $date);
+
+        if ($date == '0001-01-01 00:00:00' || $date == '0001-01-01') {
+            return null;
+        }
+
+        try {
+            return Carbon::parse($date)->format('Y-m-d H:i:s');
+        } catch (\Exception $e) {
+            return null;
+        }
+    }
+
+    // Parse C# DateTimeOffset to Laravel timestamp
+    protected function parseDateTimeOffset($date)
+    {
+        if (! $date) {
+            return null;
+        }
+
+        $date = trim((string) $date);
+
+        // Handle C# DateTimeOffset JSON format: /Date(1234567890000+0200)/
+        if (preg_match('/^\/Date\((-?\d+)([+-]\d{4})?\)\/$/', $date, $matches)) {
+            $timestamp = (int) $matches[1];
+            // C# timestamp is in milliseconds, convert to seconds
+            $timestamp = $timestamp / 1000;
+
+            return Carbon::createFromTimestamp($timestamp)->format('Y-m-d H:i:s');
+        }
+
+        // Handle ISO 8601 format with offset: 2024-01-15T10:30:00+02:00
+        if (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/', $date)) {
+            try {
+                return Carbon::parse($date)->format('Y-m-d H:i:s');
+            } catch (\Exception $e) {
+                return null;
+            }
+        }
+
+        // Fall back to cleanDate for standard formats
+        return $this->cleanDate($date);
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 }
