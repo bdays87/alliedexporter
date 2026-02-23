@@ -2,7 +2,7 @@
 
 namespace App\Console\Commands;
 
-use App\Models\NewInvoice;
+use App\Models\Newinvoice;
 use App\Models\NewPayment;
 use App\Models\NewReceipt;
 use Illuminate\Console\Command;
@@ -24,7 +24,7 @@ class ImportReceipt extends Command
         foreach ($suspenses as $suspense) {
 
             // Find latest invoice for customer
-            $invoice = NewInvoice::where('customer_id', $suspense->customer_id)
+            $invoice = Newinvoice::where('customer_id', $suspense->customer_id)
                 ->orderBy('id', 'desc')
                 ->first();
 
