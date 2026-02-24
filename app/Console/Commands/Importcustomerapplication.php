@@ -29,7 +29,9 @@ class Importcustomerapplication extends Command
      */
     public function handle()
     {
-        $customerapplications = Customerapplication::with('customer')->get();
+       $customerapplications = Customerapplication::with('customer')
+                                ->whereIn('ApprovalStatus', ['AWAITING', 'APPROVED'])
+                                ->get();
 
         foreach ($customerapplications as $customerapplication) {
 
@@ -52,11 +54,11 @@ class Importcustomerapplication extends Command
 
             // Status logic
             if ($customerapplication->RegistrarStatus == 0 && $customerapplication->AccountStatus == 0) {
-                $status = 'AWAITING_REGISTRATION';
+                $status = 'AWAITING';
             } elseif ($customerapplication->RegistrarStatus == 1 && $customerapplication->AccountStatus == 0) {
-                $status = 'AWAITING_FINANCE';
+                $status = 'AWAITING';
             } elseif ($customerapplication->RegistrarStatus == 1 && $customerapplication->AccountStatus == 1 && $customerapplication->ApprovalStatus == 'AWAITING') {
-                $status = 'AWAITING_REGISTRAR';
+                $status = 'AWAITING';
             } else {
                 $status = 'APPROVED';
             }
