@@ -22,6 +22,12 @@ class ImportReceipt extends Command
         $suspenses = NewPayment::where('status', 'PENDING')->get();
 
         foreach ($suspenses as $suspense) {
+            // Check if receipt already exists for this suspense
+            $existingReceipt = NewReceipt::where('suspense_id', $suspense->id)->first();
+            if ($existingReceipt) {
+                $this->info('Receipt already exists for suspense ID ' . $suspense->id . '. Skipping...');
+                continue;
+            }
 
             // Find latest invoice for customer
             $invoice = Newinvoice::where('customer_id', $suspense->customer_id)

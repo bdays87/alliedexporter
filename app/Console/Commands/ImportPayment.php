@@ -22,6 +22,12 @@ class ImportPayment extends Command
         $counter = 0;
 
         foreach ($payments as $payment) {
+            // Check if payment already exists
+            $existingPayment = NewPayment::where('id', $payment->Id)->first();
+            if ($existingPayment) {
+                $this->info('Payment ' . $payment->Id . ' already exists. Skipping...');
+                continue;
+            }
 
             if (! $payment->applicationinvoice) {
                 $this->error('Invoice missing for Payment ID: '.$payment->Id);

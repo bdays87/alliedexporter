@@ -34,6 +34,12 @@ class Importcustomerapplication extends Command
                                 ->get();
 
         foreach ($customerapplications as $customerapplication) {
+            // Check if application already exists
+            $existingApplication = Newcustomerapplication::where('id', $customerapplication->Id)->first();
+            if ($existingApplication) {
+                $this->info('Application ' . $customerapplication->Id . ' already exists. Skipping...');
+                continue;
+            }
 
             $customer = Newcustomer::where('id', $customerapplication->CustomerId)->first();
             if (! $customer) {
@@ -53,12 +59,14 @@ class Importcustomerapplication extends Command
             $status = 'PENDING';
 
             // Status logic
-            if ($customerapplication->RegistrarStatus == 0 && $customerapplication->AccountStatus == 0) {
-                $status = 'AWAITING';
-            } elseif ($customerapplication->RegistrarStatus == 1 && $customerapplication->AccountStatus == 0) {
-                $status = 'AWAITING';
+             if ($customerapplication->RegistrarStatus == 0 && $customerapplication->AccountStatus == 0 && $customerapplication->ApprovalStatus == 'PENDING') {
+                $status = 'PENDING';
+             }elseif ($customerapplication->RegistrarStatus == 0 && $customerapplication->AccountStatus == 0 && $customerapplication->ApprovalStatus == 'AWAITING') {
+                $status = 'AWAITING_REGISTRATION';
+            } elseif ($customerapplication->RegistrarStatus == 1 && $customerapplication->AccountStatus == 0 && $customerapplication->ApprovalStatus == 'AWAITING') {
+                $status = 'AWAITING_FINANCE';
             } elseif ($customerapplication->RegistrarStatus == 1 && $customerapplication->AccountStatus == 1 && $customerapplication->ApprovalStatus == 'AWAITING') {
-                $status = 'AWAITING';
+                $status = 'AWAITING_REG';
             } else {
                 $status = 'APPROVED';
             }

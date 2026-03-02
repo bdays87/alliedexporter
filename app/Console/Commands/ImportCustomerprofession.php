@@ -40,6 +40,14 @@ class ImportCustomerprofession extends Command
         $professions = Newprofession::all();
         foreach ($customerprofessions as $customerprofession) {
             $id = $customerprofession->Id;
+
+            // Check if customer profession already exists
+            $existingCustomerProfession = Newcustomerprofession::where('id', $id)->first();
+            if ($existingCustomerProfession) {
+                $this->info('Customer Profession ' . $id . ' already exists. Skipping...');
+                continue;
+            }
+
             $profession = $professions->where('name', $customerprofession->profession->Description)->where("prefix", $customerprofession->profession->Prefix)->first();
             if ($profession) {
                 if (!$customerprofession->customer) {

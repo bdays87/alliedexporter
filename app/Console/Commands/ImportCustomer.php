@@ -44,6 +44,14 @@ class ImportCustomer extends Command
         $userCounter = 0;
         foreach ($oldcustoer as $customer) {
             $id = $customer->Id;
+
+            // Check if customer already exists
+            $existingCustomer = Newcustomer::where('id', $id)->first();
+            if ($existingCustomer) {
+                $this->info('Customer ' . $id . ' already exists. Skipping...');
+                continue;
+            }
+
             $uuid = Str::uuid()->toString();
             $title = $customer->title ? $customer->title->Title : "Mr";
             $name = $customer->FirstName;
