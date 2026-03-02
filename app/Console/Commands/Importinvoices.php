@@ -44,6 +44,14 @@ class Importinvoices extends Command
         $this->info('Total Invoices: '.$invoices->count());
         foreach ($invoices as $invoice) {
             $id = $invoice->Id;
+
+            // Check if invoice already exists
+            $existingInvoice = \App\Models\Newinvoice::where('id', $id)->first();
+            if ($existingInvoice) {
+                $this->info('Invoice ' . $id . ' already exists. Skipping...');
+                continue;
+            }
+
             $customer_id = $invoice->customerapplication->CustomerId;
 
             $checkcustomer = \App\Models\Newcustomer::where('id', $customer_id)->first();

@@ -30,6 +30,13 @@ class ImportRegistrations extends Command
     {
         $registrations = Registration::with("profession")->get();
         foreach ($registrations as $registration) {
+            // Check if registration already exists
+            $existingRegistration = \App\Models\Newcustomerregistration::where('id', $registration->Id)->first();
+            if ($existingRegistration) {
+                $this->info('Registration ' . $registration->Id . ' already exists. Skipping...');
+                continue;
+            }
+
             $checkcustomer = Newcustomer::where('id', $registration->CustomerId)->first();
             if ($checkcustomer) {
                 $checkprofession = \App\Models\Newprofession::where('name', $registration->profession->Description)->where("prefix", $registration->profession->Prefix)->first();
