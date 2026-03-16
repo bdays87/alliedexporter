@@ -2,7 +2,12 @@
 
 namespace App\Console\Commands;
 
+use App\Models\NewCustomerContact;
+use App\Models\CustomerContact;
+use Carbon\Carbon;
 use Illuminate\Console\Command;
+use App\Models\Newuser;
+use Illuminate\Support\Str;
 
 class ImportCustomerContact extends Command
 {
@@ -25,6 +30,116 @@ class ImportCustomerContact extends Command
      */
     public function handle()
     {
-        //
+
+        $countnew = NewCustomerContact::count();
+        $oldcustomercontacts = [];
+        if ($countnew > 0) {
+            $oldcustomercontacts = CustomerContact::with('customer')->where('id', '>', $countnew)->get();
+        } else {
+            $oldcustomercontacts  =  CustomerContact::with('customer')->get();
+        }
+
+         $this->info('Total Customer Contacts Found: '.$oldcustomercontacts->count());
+        $counter = 0;
+        foreach ($oldcustomercontacts as $student) {
+
+         // Check if student already exists by ID
+            $existingStudent = NewCustomerContact::where('id', $student->Id)->first();
+            if ($existingStudent) {
+                $this->info('Customer Contact ' . $student->Id . ' already exists. Skipping...');
+                continue;
+            }
+
+            $new = new NewCustomerContact;
+            $new->id = $student->Id;
+            $new->customer_id = $student->CustomerId;
+            $new->name = null;
+            $new->relationship = null;
+            $new->primaryphone = $student->PrimaryPhone;
+            $new->secondaryphone = $student->SecondaryPhone;
+            $new->email = $student->Email;
+            $new->created_at = now();
+            $new->updated_at =  now();
+
+            $new->save();
+
+              $counter++;
+            $this->info("Customer Contact {$counter} imported: {$student->customer->fullname}");
+        }
+    }
+
+
+    // Parse DOB
+    protected function parseDate($dateString)
+    {
+        if (! $dateString) {
+            return null;
+        }
+        $dateString = trim($dateString);
+
+        if ($dateString == '0001-01-01' || $dateString == '0001-01-01 00:00:00') {
+            return null;
+        }
+
+        if (preg_match('/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/', $dateString, $m)) {
+            return "{$m[3]}-".str_pad($m[2], 2, '0', STR_PAD_LEFT).'-'.str_pad($m[1], 2, '0', STR_PAD_LEFT);
+        }
+
+        try {
+            return Carbon::parse($dateString)->format('Y-m-d');
+        } catch (\Exception $e) {
+            return null;
+        }
+    }
+
+    // ✅ Clean C# DateTime.MinValue
+    protected function cleanDate($date)
+    {
+        if (! $date) {
+            return null;
+        }
+
+        $date = trim((string) $date);
+
+        if ($date == '0001-01-01 00:00:00' || $date == '0001-01-01') {
+            return null;
+        }
+
+        try {
+            return Carbon::parse($date)->format('Y-m-d H:i:s');
+        } catch (\Exception $e) {
+            return null;
+        }
+    }
+
+    // Parse C# DateTimeOffset to Laravel timestamp
+    protected function parseDateTimeOffset($date)
+    {
+        if (! $date) {
+            return null;
+        }
+
+        $date = trim((string) $date);
+
+        // Handle C# DateTimeOffset JSON format: /Date(1234567890000+0200)/
+        if (preg_match('/^\/Date\((-?\d+)([+-]\d{4})?\)\/$/', $date, $matches)) {
+            $timestamp = (int) $matches[1];
+            // C# timestamp is in milliseconds, convert to seconds
+            $timestamp = $timestamp / 1000;
+
+            return Carbon::createFromTimestamp($timestamp)->format('Y-m-d H:i:s');
+        }
+
+        // Handle ISO 8601 format with offset: 2024-01-15T10:30:00+02:00
+        if (preg_match('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/', $date)) {
+            try {
+                return Carbon::parse($date)->format('Y-m-d H:i:s');
+            } catch (\Exception $e) {
+                return null;
+            }
+        }
+
+        // Fall back to cleanDate for standard formats
+        return $this->cleanDate($date);
     }
 }

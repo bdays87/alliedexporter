@@ -1,23 +1,21 @@
 <?php
 
 namespace App\Console\Commands;
-
-use Illuminate\Console\Command;
-use App\Models\CustomerCPD;
-use App\Models\Newcustomerprofession;
-use App\Models\NewCustomerCPD;
-use App\Models\Newcustomeruser;
-use Illuminate\Support\Str;
+use App\Models\NewCustomerEmployement;
+use App\Models\CustomerEmployement;
 use Carbon\Carbon;
+use Illuminate\Console\Command;
+use App\Models\Newuser;
+use Illuminate\Support\Str;
 
-class ImportCustomerCPD extends Command
+class ImportEmployement extends Command
 {
     /**
      * The name and signature of the console command.
      *
      * @var string
      */
-    protected $signature = 'app:import-customer-c-p-d';
+    protected $signature = 'app:import-employement';
 
     /**
      * The console command description.
@@ -26,66 +24,51 @@ class ImportCustomerCPD extends Command
      */
     protected $description = 'Command description';
 
-    /**
-     * Execute the console command.
-     */
-
     public function handle()
     {
-        $this->info("Importing CPD records...");
 
-        $cpds = CustomerCPD::with('customer')->get();
-
-        foreach ($cpds as $cpd) {
-            // Check if CPD record already exists
-            $existingCPD = NewCustomerCPD::where('id', $cpd->id)->first();
-            if ($existingCPD) {
-                $this->info('CPD record ' . $cpd->id . ' already exists. Skipping...');
-                continue;
-            }
-
-            // Get profession
-            $profession = Newcustomerprofession::where('customer_id', $cpd->CustomerId)->first();
-
-            // Get user mapping
-            $customeruser = Newcustomeruser::where('customer_id', $cpd->CustomerId)->first();
-
-            if (!$profession) {
-                $this->warn("No profession for customer ID: {$cpd->CustomerId}");
-                continue;
-            }
-
-            // Extract user id safely
-            $userId = $customeruser ? $customeruser->user_id : null;
-            $createdAt = $this->parseDateTimeOffset($cpd->DateCreated) ?? now();
-            $updatedAt = $this->parseDateTimeOffset($cpd->DateUpdated) ?? $createdAt;
-            NewCustomerCPD::create([
-                'id' => $cpd->id,
-                'customerprofession_id' => $profession->id,
-                'title' => 'Imported CPD',
-                'year' => $cpd->RenewalPeriod,
-                'description' => 'Imported CPD record for customer ID: '.$cpd->CustomerId,
-                'type' => 'PHYSICAL',
-                'points' => $cpd->Points,
-                'durationunit' => "HOURS",
-                'user_id' => $userId,   // ✅ fixed
-                'status' => 'PROCESSED',
-                'comment' => 'Imported from old system',
-                'assessed_by' => 1,//
-                'assessed_at' => $updatedAt,
-                'created_at' => $createdAt,
-                'updated_at' => $updatedAt,
-            ]);
+        $countnew = NewCustomerEmployement::count();
+        $oldcustoer = [];
+        if ($countnew > 0) {
+            $oldcustoer = CustomerEmployement::with('customer')->where('id', '>', $countnew)->get();
+        } else {
+            $oldcustoer  =  CustomerEmployement::with('customer')->get();
         }
 
-        $this->info("CPD Import Completed!");
+         $this->info('Total Customer Employement Found: '.$oldcustoer->count());
+        $counter = 0;
+        foreach ($oldcustoer as $student) {
+
+         // Check if student already exists by ID
+            $existingStudent = NewCustomerEmployement::where('id', $student->Id)->first();
+            if ($existingStudent) {
+                $this->info('Employement ' . $student->Id . ' already exists. Skipping...');
+                continue;
+            }
+
+            $new = new NewCustomerEmployement;
+            $new->id = $student->Id;
+            $new->customer_id = $student->CustomerId;
+            $new->companyname = $student->Name;
+            $new->position = $student->JobTitle;
+            $new->start_date = $student->CommencementData;;
+            $new->end_date = null;
+            $new->phone = $student->Phone;
+            $new->email = $student->Email;
+            $new->address = $student->Address;
+            $new->contactperson = $student->ContactPerson;
+            $new->created_at = now();
+            $new->updated_at =  now();
+
+            $new->save();
+
+              $counter++;
+            $this->info("Employement {$counter} imported: {$student->customer->fullname}");
+        }
     }
 
 
-
-
-
-// Parse DOB
+    // Parse DOB
     protected function parseDate($dateString)
     {
         if (! $dateString) {
@@ -158,12 +141,6 @@ class ImportCustomerCPD extends Command
         // Fall back to cleanDate for standard formats
         return $this->cleanDate($date);
     }
-
-
-
-
-
-
 
 
 }

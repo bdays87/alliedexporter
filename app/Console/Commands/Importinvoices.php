@@ -80,12 +80,13 @@ class Importinvoices extends Command
             $year = Carbon::parse($invoice->DateCreated)->year;
             if ($amount == $total) {
                 $status = 'PAID';
-            } else {
-                $customerapplication->status = 'AWAITING';
-                $customerapplication->save();
-                $customerapplication->customerprofession->status = 'AWAITING_APP';
-                $customerapplication->customerprofession->save();
             }
+            // else {
+            //     $customerapplication->status = 'AWAITING';
+            //     $customerapplication->save();
+            //     $customerapplication->customerprofession->status = 'AWAITING_APP';
+            //     $customerapplication->customerprofession->save();
+            // }
             $newinvoice = new \App\Models\Newinvoice;
             $newinvoice->id = $id;
             $newinvoice->customer_id = $customer_id;

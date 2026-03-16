@@ -28,16 +28,26 @@ class ImportStudent extends Command
         $counter = 0;
 
         foreach ($oldStudents as $student) {
+            // Check if student already exists by ID
+            $existingStudent = NewStudent::where('id', $student->Id)->first();
+            if ($existingStudent) {
+                $this->info('Student ' . $student->Id . ' already exists. Skipping...');
+                continue;
+            }
 
-            // Avoid duplicates
-            $exists = NewStudent::where('regnumber', $student->RegistrationNumber)
-                ->orWhere('email', $student->Email)
-                ->first();
+            // Avoid duplicates by registration number or email
+            // $exists = NewStudent::where('regnumber', $student->RegistrationNumber)
+            //     ->orWhere('email', $student->Email)
+            //     ->first();
 
-            $log = date('Y-m-d H:i:s').
-               " | DUPLICATE REG: {$student->RegistrationNumber}| NAME: {$student->Name} | SURNAME: {$student->Surname} | EMAIL: {$student->Email}\n";
+            // if ($exists) {
+            //     $log = date('Y-m-d H:i:s').
+            //        " | DUPLICATE REG: {$student->RegistrationNumber}| NAME: {$student->Name} | SURNAME: {$student->Surname} | EMAIL: {$student->Email}\n";
 
-            file_put_contents($logFile, $log, FILE_APPEND);
+            //     file_put_contents($logFile, $log, FILE_APPEND);
+            //     $this->warn("Duplicate found: {$student->RegistrationNumber}");
+            //     continue;
+            // }
 
             $new = new NewStudent;
             $new->id = $student->Id;
