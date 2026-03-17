@@ -4,7 +4,7 @@ namespace App\Console\Commands;
 
 use App\Models\Customerprofession;
 use App\Models\Newcustomerprofession;
-
+use App\Models\ProfessionTire;
 use App\Models\Newprofession;
 use App\Models\Newregistertype;
 use Carbon\Carbon;
@@ -48,6 +48,7 @@ class ImportCustomerprofession extends Command
                 continue;
             }
 
+
             $profession = $professions->where('name', $customerprofession->profession->Description)->where("prefix", $customerprofession->profession->Prefix)->first();
             if ($profession) {
                 if (!$customerprofession->customer) {
@@ -57,6 +58,13 @@ class ImportCustomerprofession extends Command
                 $registertype = $registertypes->where('name', $customerprofession->customer->RegisterName)->first();
                 $registration = $customerprofession->customer->registrations()->where('ProfessionId', $customerprofession->ProfessionId)->first();
 
+
+                $tire_id;
+                $existingProfessiontire = ProfessionTire::with('renewaltire')->where('ProfessionId', $customerprofession->ProfessionId)->first();
+
+                if ($existingProfessiontire !=null) {
+                      $tire_id=$existingProfessiontire->RenewalTireId;
+                   }
                 $customer_id = $customerprofession->CustomerId;
                 $profession_id = $profession->id;
                 $customertype_id = $customerprofession->customer->CustomerTypeId != 1 ? 3 : 1;
@@ -64,7 +72,7 @@ class ImportCustomerprofession extends Command
                 $employmentlocation_id = $customerprofession->customer->EmploymentLocationId;
                 $registertype_id = $registertype ? $registertype->id : null;
                 $registrationnumber = $customerprofession->customer->Prefix . $customerprofession->customer->RegistrationNumber;
-                $tire_id = 1;
+                // $tire_id = 1;
                 $uuid = Str::uuid()->toString();
                 $employmentsector = "PUBLIC";
                 $status = "APPROVED";

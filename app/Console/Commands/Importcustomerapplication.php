@@ -57,19 +57,40 @@ class Importcustomerapplication extends Command
 
             // Default status
             $status = 'PENDING';
+            $registration = 0;
+            $accounts = 0;
 
             // Status logic
              if ($customerapplication->RegistrarStatus == 0 && $customerapplication->AccountStatus == 0 && $customerapplication->ApprovalStatus == 'PENDING') {
                 $status = 'PENDING';
+                $registration = 0;
+                $accounts = 0;
              }elseif ($customerapplication->RegistrarStatus == 0 && $customerapplication->AccountStatus == 0 && $customerapplication->ApprovalStatus == 'AWAITING') {
-                $status = 'AWAITING_REGISTRATION';
+                $status = 'PENDING';
+                $registration = 0;
+                $accounts = 0;
             } elseif ($customerapplication->RegistrarStatus == 1 && $customerapplication->AccountStatus == 0 && $customerapplication->ApprovalStatus == 'AWAITING') {
-                $status = 'AWAITING_FINANCE';
+                $status = 'AWAITING';
+                $registration = 1;
+                $accounts = 0;
             } elseif ($customerapplication->RegistrarStatus == 1 && $customerapplication->AccountStatus == 1 && $customerapplication->ApprovalStatus == 'AWAITING') {
-                $status = 'AWAITING_REG';
+                $status = 'AWAITING';
+                 $registration = 1;
+                 $accounts = 1;
             } else {
                 $status = 'APPROVED';
+                 $registration = 1;
+                 $accounts = 1;
             }
+
+            $this->info('Importing application id: '.$customerapplication->Id.' with status: '.$status);
+           $apptype;
+           if($customerapplication->RenewalCategoryId == 4){
+              $apptype = 3;
+           }
+           else{
+                $apptype = $customerapplication->ApplicationTypeId;
+           }
 
             // Create new application
             $newcustomerapplication = new Newcustomerapplication;
@@ -77,12 +98,14 @@ class Importcustomerapplication extends Command
             $newcustomerapplication->customer_id = $customer->id;
             $newcustomerapplication->customerprofession_id = $customerprofession->id;
             $newcustomerapplication->status = $status;
+            $newcustomerapplication->registration = $registration;
+            $newcustomerapplication->accounts = $accounts;
             $newcustomerapplication->certificate_number = $customerapplication->CertificateNumber;
             $newcustomerapplication->certificate_expiry_date = $customerapplication->RenewalPeriod.'-12-31';
             $newcustomerapplication->year = $customerapplication->RenewalPeriod;
             $newcustomerapplication->registertype_id = $customerprofession->registertype_id ?? 1;
             $newcustomerapplication->registration_date = $customerapplication->DateCreated;
-            $newcustomerapplication->applicationtype_id = $customerapplication->ApplicationTypeId;
+            $newcustomerapplication->applicationtype_id = $apptype;
             $newcustomerapplication->uuid = \Str::uuid();
 
             // Handle C# DateTimeOffset format and convert to Laravel timestamp
