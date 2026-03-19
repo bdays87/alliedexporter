@@ -40,52 +40,77 @@ class ExportCustomerApplication extends Command
         // Get invoice for payment item and amount details
         $invoice = Applicationinvoice::where('CustomerApplicationId', $app->id)->first();
 
-        // Map status back based on application status
+        // Check if invoice is paid
+        $isPaid = false;
+        $totalPaid = 0;
+        $totalDue = 0;
+
+        if ($invoice) {
+            $totalDue = floatval($invoice->TotalDue ?? $invoice->AmountDue ?? 0);
+            $totalPaid = $this->getTotalPaid($app->id);
+            $isPaid = $totalPaid >= $totalDue;
+        }
+
+        // Map status based on application status from new system
+        // APPROVED = fully approved (don't mix)
+        // AWAITING = invoice paid, waiting for registration/account approval
+        // PENDING = not paid yet
         $approvalStatus = 'PENDING';
         $registrarStatus = 0;
         $accountStatus = 0;
-        $renewalStatusId = 3; // Default pending
+        $renewalStatusId = 3; // Default owing
 
-        $cdpoints =  0;
-       $placement =  0;
+        $cdpoints = 0;
+        $placement = 0;
 
-
-        if ($app->status == 'PENDING'  && $app->registration == 0 && $app->accounts == 0) {
-            $approvalStatus = 'PENDING';
-            $renewalStatusId = 3;
-            $registrarStatus = 0;
-            $accountStatus = 0;
-            $cdpoints =  0;
-            $placement =  0;
-        } elseif ($app->status == 'AWAITING' && $app->registration == 0 && $app->accounts == 0) {
-            $approvalStatus = 'AWAITING';
-            $renewalStatusId = 1;
-            $registrarStatus = $app->registration ?? 0;
-            $accountStatus = $app->accounts ?? 0;
-             $cdpoints =  1;
-            $placement =  1;
-        }
-
-elseif ($app->status == 'AWAITING' && $app->registration == 1 && $app->accounts == 0) {
-            $approvalStatus = 'AWAITING';
-            $renewalStatusId = 1;
-            $registrarStatus = $app->registration ?? 0;
-            $accountStatus = $app->accounts ?? 0;
-             $cdpoints =  1;
-            $placement =  1;
-        }
-
-
-
-
-        elseif ($app->status == 'APPROVED' && $app->registration == 1 && $app->accounts == 1) {
+        // If status is APPROVED - keep as approved
+        if ($app->status == 'APPROVED') {
             $approvalStatus = 'APPROVED';
-            $renewalStatusId = 1;
+            $renewalStatusId = $isPaid ? 1 : 3; // paid = 1, owing = 3
             $registrarStatus = 1;
             $accountStatus = 1;
-                // CDP points and placement - default to 1 if approved
-            $cdpoints =  1;
-            $placement =  1;
+            $cdpoints = 1;
+            $placement = 1;
+        }
+        // If status is AWAITING - invoice is paid, waiting for registration or account approval
+        elseif ($app->status == 'AWAITING') {
+            $approvalStatus = 'AWAITING';
+            $renewalStatusId = $isPaid ? 1 : 3; // paid = 1, owing = 3
+            $registrarStatus = $app->registration ?? 0;
+            $accountStatus = $app->accounts ?? 0;
+           $cdpoints = 1;
+                $placement = 1;
+        }
+        // If status is PENDING - check if invoice exists and is paid
+        elseif ($app->status == 'PENDING') {
+            // Check if invoice exists
+            if (!$invoice) {
+                // No invoice exists - PENDING OWING
+                $approvalStatus = 'PENDING';
+                $renewalStatusId = 3; // owing
+                $registrarStatus = 0;
+                $accountStatus = 0;
+                $cdpoints = 0;
+                $placement = 0;
+            }
+            // Check if invoice was already paid in old system
+            elseif ($isPaid) {
+                // Invoice is paid but waiting at Registration stage
+                $approvalStatus = 'AWAITING';
+                $renewalStatusId = 1; // paid
+                $registrarStatus = 0; // waiting at registration
+                $accountStatus = 0;   // not yet at accounts
+                $cdpoints = 1;
+                $placement = 1;
+            } else {
+                // Invoice exists but not paid - PENDING OWING
+                $approvalStatus = 'PENDING';
+                $renewalStatusId = 3; // owing
+                $registrarStatus = 0;
+                $accountStatus = 0;
+                $cdpoints = 0;
+                $placement = 0;
+            }
         }
 
 
@@ -170,7 +195,7 @@ elseif ($app->status == 'AWAITING' && $app->registration == 1 && $app->accounts 
             $new->RenewalPeriod = $nextRenewal;
             $new->PaymentItemId = $paymentItemId;
             $new->RenewalStatusId = $renewalStatusId;
-             $new->PaymentMethodId = 1;
+            $new->PaymentMethodId = 1;
             $new->balance = $balance;
             $new->Cdpoints = $cdpoints;
             $new->Placement = $placement;
