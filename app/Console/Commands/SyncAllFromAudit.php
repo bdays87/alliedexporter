@@ -3,38 +3,58 @@
 namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
-use App\Console\Commands\SyncCustomerApplicationFromAudit;
-use App\Console\Commands\SyncApplicationInvoiceFromAudit;
-use App\Console\Commands\SyncApplicationPaymentFromAudit;
 
 class SyncAllFromAudit extends Command
 {
-    protected $signature = 'sync:all {--year=2026 : The year to filter by}';
-    protected $description = 'Sync all customerapplication, invoices and payments from auditentries';
+    protected $signature = 'sync:all
+                            {--year=2026 : Sync a single specific year}
+                            {--all-years : Sync all years from --from-year up to --year}
+                            {--from-year=2020 : Start year when using --all-years}';
+
+    protected $description = 'Sync customerapplication, invoices and payments from auditentries. Past years: APPROVED only. Current year: AWAITING + APPROVED.';
 
     public function handle(): int
     {
-        $year = (int) $this->option('year');
+        $currentYear = (int) $this->option('year');
+        $allYears = (bool) $this->option('all-years');
+        $fromYear = (int) $this->option('from-year');
 
-        $this->info("========================================");
-        $this->info("Starting full sync for year {$year}");
-        $this->info("========================================");
+        $years = $allYears
+            ? range($fromYear, $currentYear)
+            : [$currentYear];
 
-        // Step 1: Sync CustomerApplication
-        $this->info("\n[1/3] Syncing CustomerApplication...");
-        $this->call(SyncCustomerApplicationFromAudit::class, ['--year' => $year]);
+        $this->info('========================================');
+        $this->info('Starting full sync');
+        $this->info('Years: '.implode(', ', $years));
+        $this->info("Current year (AWAITING+APPROVED): {$currentYear}");
+        $this->info('Past years (APPROVED only): all others');
+        $this->info('========================================');
 
-        // Step 2: Sync ApplicationInvoice (requires Application to exist)
-        $this->info("\n[2/3] Syncing ApplicationInvoice...");
-        $this->call(SyncApplicationInvoiceFromAudit::class, ['--year' => $year]);
+        foreach ($years as $year) {
+            $this->info("\n======== Year {$year} ========");
 
-        // Step 3: Sync ApplicationPayment (requires Invoice to exist)
-        $this->info("\n[3/3] Syncing ApplicationPayment...");
-        $this->call(SyncApplicationPaymentFromAudit::class, ['--year' => $year]);
+            $this->info("\n[1/3] Syncing CustomerApplication for {$year}...");
+            $this->call(SyncCustomerApplicationFromAudit::class, [
+                '--year' => $year,
+                '--current-year' => $currentYear,
+            ]);
+
+            $this->info("\n[2/3] Syncing ApplicationInvoice for {$year}...");
+            $this->call(SyncApplicationInvoiceFromAudit::class, [
+                '--year' => $year,
+                '--current-year' => $currentYear,
+            ]);
+
+            $this->info("\n[3/3] Syncing ApplicationPayment for {$year}...");
+            $this->call(SyncApplicationPaymentFromAudit::class, [
+                '--year' => $year,
+                '--current-year' => $currentYear,
+            ]);
+        }
 
         $this->info("\n========================================");
-        $this->info("Full sync completed for year {$year}");
-        $this->info("========================================");
+        $this->info('Full sync completed');
+        $this->info('========================================');
 
         return Command::SUCCESS;
     }

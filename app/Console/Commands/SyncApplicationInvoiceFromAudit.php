@@ -7,17 +7,23 @@ use Illuminate\Support\Facades\DB;
 
 class SyncApplicationInvoiceFromAudit extends Command
 {
-    protected $signature = 'sync:applicationinvoice {--year=2026 : The year to filter by}';
-    protected $description = 'Sync applicationinvoice from auditentries - finds final status from audit trail';
+    protected $signature = 'sync:applicationinvoice
+                            {--year=2026 : The renewal period year to filter by}
+                            {--current-year=2026 : The actual current year (used to decide status filter)}';
+
+    protected $description = 'Sync applicationinvoice from auditentries. One invoice per application unless split-currency (ZWG+USD). Past years: APPROVED apps only. Current year: AWAITING+APPROVED.';
 
     public function handle(): int
     {
         $year = (int) $this->option('year');
+        $currentYear = (int) $this->option('current-year');
 
-        $this->info("Syncing ApplicationInvoice for year {$year}...");
+        $allowedStatuses = ($year < $currentYear)
+            ? ['APPROVED']
+            : ['AWAITING', 'APPROVED'];
 
-        // Get all audit entries ordered by timestamp
-        // Include both current year and previous year (Oct 2025 for 2026 renewal)
+        $this->info("Syncing ApplicationInvoice for year {$year} (apps: ".implode(', ', $allowedStatuses).')...');
+
         $audits = DB::connection('mysql')
             ->table('auditentries')
             ->where('EntityName', 'Applicationinvoice')
@@ -27,122 +33,125 @@ class SyncApplicationInvoiceFromAudit extends Command
 
         $this->info("Found {$audits->count()} audit records");
 
-        // Group by invoice ID to track all changes
+        // Group all changes per invoice ID
         $invoiceChanges = [];
 
         foreach ($audits as $audit) {
             $data = json_decode($audit->Changes, true);
 
-            if (!$data || !isset($data['Id'])) {
+            if (! $data || ! isset($data['Id'])) {
                 continue;
             }
 
-            $invoiceId = $data['Id'];
-
-            // Track each change for this invoice
-            $invoiceChanges[$invoiceId][] = [
+            $invoiceChanges[$data['Id']][] = [
                 'data' => $data,
-                'timestamp' => $audit->timestamp ?? $audit->Timestamp ?? now(),
+                'timestamp' => $audit->Timestamp ?? $audit->timestamp ?? now(),
             ];
         }
 
-        $this->info("Found " . count($invoiceChanges) . " unique invoices");
+        $this->info('Found '.count($invoiceChanges).' unique invoices');
+
+        // Track invoices per application to enforce one-per-app rule
+        // Exception: split payments (different currencies) allow one invoice per currency
+        // appId => [ currencyId => invoiceId ]
+        $appCurrencyMap = [];
 
         $inserted = 0;
         $updated = 0;
         $skippedNoApp = 0;
+        $skippedDupe = 0;
 
         foreach ($invoiceChanges as $invoiceId => $changes) {
-            // Get the final status (last entry)
-            $finalStatus = end($changes);
-            $data = $finalStatus['data'];
+            $finalData = end($changes)['data'];
 
-            // Only process if CustomerApplicationId exists and links to a 2026 application
-            if (!isset($data['CustomerApplicationId'])) {
+            if (! isset($finalData['CustomerApplicationId'])) {
                 $skippedNoApp++;
+
                 continue;
             }
 
-            // Verify the application exists and has 2026 period
+            $appId = $finalData['CustomerApplicationId'];
+
+            // Verify the application exists, belongs to this renewal period,
+            // and has an allowed status
             $application = DB::connection('mysql')
                 ->table('customerapplication')
-                ->where('Id', $data['CustomerApplicationId'])
+                ->where('Id', $appId)
                 ->where('RenewalPeriod', $year)
+                ->whereIn('ApprovalStatus', $allowedStatuses)
                 ->first();
 
-            if (!$application) {
+            if (! $application) {
                 $skippedNoApp++;
+
                 continue;
             }
 
-            $this->info("Invoice {$invoiceId}: Final status for Application {$data['CustomerApplicationId']}");
+            $currencyId = $finalData['CurrencyId'] ?? null;
 
-            // Check if already exists
-            $exists = DB::connection('mysql')
-                ->table('applicationinvoices')
-                ->where('Id', $invoiceId)
-                ->exists();
+            // Enforce one invoice per application per currency
+            // (split ZWG/USD payments legitimately produce two invoices)
+            if (isset($appCurrencyMap[$appId][$currencyId])) {
+                $existingInvoiceId = $appCurrencyMap[$appId][$currencyId];
+                $this->warn("  Duplicate invoice {$invoiceId} for app {$appId} / currency {$currencyId} – already have {$existingInvoiceId}, skipping");
+                $skippedDupe++;
+
+                continue;
+            }
+
+            $appCurrencyMap[$appId][$currencyId] = $invoiceId;
+
+            $this->info("Invoice {$invoiceId}: app={$appId}, currency={$currencyId}");
 
             try {
-                // Parse datetime values to MySQL format
-                $dateCreated = $this->parseDateTime($data['DateCreated'] ?? null);
-                $dateUpdated = $this->parseDateTime($data['DateUpdated'] ?? null);
-                $dateDeleted = $this->parseDateTime($data['DateDeleted'] ?? null);
+                $dateCreated = $this->parseDateTime($finalData['DateCreated'] ?? null);
+                $dateUpdated = $this->parseDateTime($finalData['DateUpdated'] ?? null);
+                $dateDeleted = $this->parseDateTime($finalData['DateDeleted'] ?? null);
+
+                $exists = DB::connection('mysql')
+                    ->table('applicationinvoices')
+                    ->where('Id', $invoiceId)
+                    ->exists();
+
+                $record = [
+                    'CustomerApplicationId' => $appId,
+                    'PaymentItemId' => $finalData['PaymentItemId'] ?? null,
+                    'RenewalTireId' => $finalData['RenewalTireId'] ?? null,
+                    'RenewalCategoryId' => $finalData['RenewalCategoryId'] ?? null,
+                    'CurrencyId' => $currencyId,
+                    'RenewalPenaltyId' => $finalData['RenewalPenaltyId'] ?? null,
+                    'AmountDue' => $finalData['AmountDue'] ?? null,
+                    'Penalty' => $finalData['Penalty'] ?? null,
+                    'TotalDue' => $finalData['TotalDue'] ?? null,
+                    'DateUpdated' => $dateUpdated,
+                    'DateDeleted' => $dateDeleted,
+                ];
 
                 if ($exists) {
-                    // Update with the final status
                     DB::connection('mysql')->table('applicationinvoices')
                         ->where('Id', $invoiceId)
-                        ->update([
-                            'CustomerApplicationId' => $data['CustomerApplicationId'],
-                            'PaymentItemId' => $data['PaymentItemId'] ?? null,
-                            'RenewalTireId' => $data['RenewalTireId'] ?? null,
-                            'RenewalCategoryId' => $data['RenewalCategoryId'] ?? null,
-                            'CurrencyId' => $data['CurrencyId'] ?? null,
-                            'RenewalPenaltyId' => $data['RenewalPenaltyId'] ?? null,
-                            'AmountDue' => $data['AmountDue'] ?? null,
-                            'Penalty' => $data['Penalty'] ?? null,
-                            'TotalDue' => $data['TotalDue'] ?? null,
-                            'DateUpdated' => $dateUpdated,
-                            'DateDeleted' => $dateDeleted,
-                        ]);
-
-                    $this->info("  → Updated");
+                        ->update($record);
+                    $this->info('  → Updated');
                     $updated++;
                 } else {
-                    DB::connection('mysql')->table('applicationinvoices')->insert([
-                        'Id' => $data['Id'],
-                        'CustomerApplicationId' => $data['CustomerApplicationId'],
-                        'PaymentItemId' => $data['PaymentItemId'] ?? null,
-                        'RenewalTireId' => $data['RenewalTireId'] ?? null,
-                        'RenewalCategoryId' => $data['RenewalCategoryId'] ?? null,
-                        'CurrencyId' => $data['CurrencyId'] ?? null,
-                        'RenewalPenaltyId' => $data['RenewalPenaltyId'] ?? null,
-                        'AmountDue' => $data['AmountDue'] ?? null,
-                        'Penalty' => $data['Penalty'] ?? null,
-                        'TotalDue' => $data['TotalDue'] ?? null,
-                        'DateCreated' => $dateCreated,
-                        'DateUpdated' => $dateUpdated,
-                        'DateDeleted' => $dateDeleted,
-                    ]);
-
-                    $this->info("  → Inserted");
+                    DB::connection('mysql')->table('applicationinvoices')
+                        ->insert(array_merge($record, [
+                            'Id' => $finalData['Id'],
+                            'DateCreated' => $dateCreated,
+                        ]));
+                    $this->info('  → Inserted');
                     $inserted++;
                 }
-
             } catch (\Exception $e) {
-                $this->error("Failed ID {$invoiceId} - " . $e->getMessage());
+                $this->error("Failed invoice {$invoiceId}: ".$e->getMessage());
             }
         }
 
-        $this->info("Done syncing ApplicationInvoice. Inserted: {$inserted}, Updated: {$updated}, Skipped (no app): {$skippedNoApp}");
+        $this->info("Done. Inserted: {$inserted}, Updated: {$updated}, Skipped (no app): {$skippedNoApp}, Skipped (duplicate): {$skippedDupe}");
 
         return Command::SUCCESS;
     }
 
-    /**
-     * Parse datetime string to MySQL format
-     */
     protected function parseDateTime(?string $value): ?string
     {
         if (empty($value)) {
@@ -150,11 +159,8 @@ class SyncApplicationInvoiceFromAudit extends Command
         }
 
         try {
-            // Handle ISO 8601 format with timezone
-            $date = new \DateTime($value);
-            return $date->format('Y-m-d H:i:s');
-        } catch (\Exception $e) {
-            // If parsing fails, return null
+            return (new \DateTime($value))->format('Y-m-d H:i:s');
+        } catch (\Exception) {
             return null;
         }
     }

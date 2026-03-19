@@ -7,16 +7,26 @@ use Illuminate\Support\Facades\DB;
 
 class SyncCustomerApplicationFromAudit extends Command
 {
-    protected $signature = 'sync:customerapplication {--year=2026 : The year to filter by}';
-    protected $description = 'Sync customerapplication from auditentries - finds final status from full audit trail';
+    protected $signature = 'sync:customerapplication
+                            {--year=2026 : The renewal period year to filter by}
+                            {--current-year=2026 : The actual current year (used to decide status filter)}';
+
+    protected $description = 'Sync customerapplication from auditentries. Past years: APPROVED only. Current year: AWAITING + APPROVED. One app per customer per renewal period.';
 
     public function handle(): int
     {
         $year = (int) $this->option('year');
+        $currentYear = (int) $this->option('current-year');
 
-        $this->info("Syncing CustomerApplication for year {$year}...");
+        // For past years only import APPROVED; for current year import AWAITING + APPROVED
+        $allowedStatuses = ($year < $currentYear)
+            ? ['APPROVED']
+            : ['AWAITING', 'APPROVED'];
 
-        // Get all audit entries for CustomerApplication in 2025 and 2026
+        $this->info("Syncing CustomerApplication for year {$year} (allowed: ".implode(', ', $allowedStatuses).')...');
+
+        // Pull audit entries spanning the renewal year and the year before
+        // (renewals often start in Oct of the prior year)
         $audits = DB::connection('mysql')
             ->table('auditentries')
             ->where('EntityName', 'CustomerApplication')
@@ -26,34 +36,34 @@ class SyncCustomerApplicationFromAudit extends Command
 
         $this->info("Found {$audits->count()} audit records");
 
-        // Group by application ID and track all status changes
+        // Group all changes per application ID
         $applicationStatuses = [];
 
         foreach ($audits as $audit) {
             $data = json_decode($audit->Changes, true);
 
-            if (!$data || !isset($data['Id'])) {
+            if (! $data || ! isset($data['Id'])) {
                 continue;
             }
 
             $appId = $data['Id'];
             $actionType = $audit->Action ?? 'UNKNOWN';
 
-            // Only process if RenewalPeriod matches the year
+            // Only care about this renewal period
             if (($data['RenewalPeriod'] ?? null) != $year) {
                 continue;
             }
 
-            // Skip DELETE actions - check if application was deleted
+            // Skip hard-deleted records
             if (strtoupper($actionType) === 'DELETE') {
-                $this->info("Application {$appId}: Marked as DELETED, skipping");
+                $this->info("Application {$appId}: DELETED – skipping");
+                unset($applicationStatuses[$appId]);
+
                 continue;
             }
 
-            // Get timestamp
-            $timestamp = $audit->timestamp ?? $audit->Timestamp ?? $audit->DateCreated ?? now();
+            $timestamp = $audit->Timestamp ?? $audit->timestamp ?? now();
 
-            // Track each status change for this application (INSERT, UPDATE)
             $applicationStatuses[$appId][] = [
                 'data' => $data,
                 'timestamp' => $timestamp,
@@ -61,244 +71,192 @@ class SyncCustomerApplicationFromAudit extends Command
             ];
         }
 
-        $this->info("Found " . count($applicationStatuses) . " unique applications (excluding deleted)");
+        $this->info('Found '.count($applicationStatuses).' unique applications (excluding deleted)');
 
-        // Track customer+year combinations to detect duplicates
+        // One application per customer per renewal period
+        // Key: customerId_year → best appId
         $customerYearMap = [];
-        $inserted = 0;
-        $updated = 0;
-        $skippedNoCustomerId = 0;
-        $skippedDuplicates = 0;
-        $skippedDeleted = 0;
 
+        // First pass: resolve which single app wins per customer
         foreach ($applicationStatuses as $appId => $statusChanges) {
-            // Get the final status (last entry in the array)
-            $finalStatus = end($statusChanges);
-            $data = $finalStatus['data'];
-            $finalAction = $finalStatus['action'];
+            $finalData = end($statusChanges)['data'];
+            $approvalStatus = strtoupper($finalData['ApprovalStatus'] ?? 'UNKNOWN');
 
-            $approvalStatus = $data['ApprovalStatus'] ?? 'UNKNOWN';
-            $this->info("Application {$appId}: Final status = {$approvalStatus} (Action: {$finalAction})");
-
-            // Skip if CustomerId is null
-            if (empty($data['CustomerId'])) {
-                $this->warn("  → Skipping ID {$appId}: CustomerId is null");
-                $logData = [
-                    'Id' => $appId,
-                    'reason' => 'CustomerId is null',
-                    'data' => $data,
-                    'timestamp' => now()->toDateTimeString(),
-                ];
-                $this->logSkippedRecord('customerapplication', $logData);
-                $skippedNoCustomerId++;
+            // Skip statuses not allowed for this year
+            if (! in_array($approvalStatus, $allowedStatuses)) {
                 continue;
             }
 
-            // Check for duplicate: one application per customer per year
-            $customerId = $data['CustomerId'];
-            $customerYearKey = $customerId . '_' . $year;
-
-            if (isset($customerYearMap[$customerYearKey])) {
-                // Already have an application for this customer in this year
-                // Check which one has more advanced status
-                $existingAppId = $customerYearMap[$customerYearKey];
-                $existingStatus = $applicationStatuses[$existingAppId] ?? [];
-                $existingFinal = end($existingStatus);
-                $existingData = $existingFinal['data'] ?? [];
-                $existingApproval = $existingData['ApprovalStatus'] ?? 'UNKNOWN';
-
-                // Priority: APPROVED > AWAITING > PENDING
-                $currentPriority = $this->getApprovalPriority($approvalStatus);
-                $existingPriority = $this->getApprovalPriority($existingApproval);
-
-                if ($currentPriority > $existingPriority) {
-                    // Current one has higher priority, use it instead
-                    $this->info("  → Replacing {$existingAppId} ({$existingApproval}) with {$appId} ({$approvalStatus}) - more advanced status");
-                    $customerYearMap[$customerYearKey] = $appId;
-                } else {
-                    $this->warn("  → Skipping duplicate: Customer {$customerId} already has application {$existingAppId} ({$existingApproval})");
-                    $skippedDuplicates++;
-                    continue;
-                }
-            } else {
-                $customerYearMap[$customerYearKey] = $appId;
+            $customerId = $finalData['CustomerId'] ?? null;
+            if (! $customerId) {
+                continue;
             }
 
-            // Check if already exists in database
-            $exists = DB::connection('mysql')
-                ->table('customerapplication')
-                ->where('Id', $appId)
-                ->exists();
+            $key = $customerId.'_'.$year;
+
+            if (! isset($customerYearMap[$key])) {
+                $customerYearMap[$key] = $appId;
+            } else {
+                // Keep the one with the higher approval priority
+                $existingId = $customerYearMap[$key];
+                $existingFinal = end($applicationStatuses[$existingId])['data'];
+                $existingStatus = strtoupper($existingFinal['ApprovalStatus'] ?? '');
+
+                if ($this->approvalPriority($approvalStatus) > $this->approvalPriority($existingStatus)) {
+                    $this->info("  Replacing app {$existingId} ({$existingStatus}) with {$appId} ({$approvalStatus}) for customer {$customerId}");
+                    $customerYearMap[$key] = $appId;
+                } else {
+                    $this->warn("  Duplicate skipped: customer {$customerId} already has app {$existingId} ({$existingStatus}), ignoring {$appId} ({$approvalStatus})");
+                }
+            }
+        }
+
+        $inserted = 0;
+        $updated = 0;
+        $skippedNoCustomer = 0;
+        $skippedStatus = 0;
+
+        foreach ($customerYearMap as $key => $appId) {
+            $statusChanges = $applicationStatuses[$appId];
+            $finalEntry = end($statusChanges);
+            $data = $finalEntry['data'];
+            $approvalStatus = strtoupper($data['ApprovalStatus'] ?? 'UNKNOWN');
+
+            $this->info("Application {$appId}: status={$approvalStatus}, customer={$data['CustomerId']}");
+
+            if (empty($data['CustomerId'])) {
+                $this->warn('  → Skipping: CustomerId is null');
+                $this->logSkipped('customerapplication', ['Id' => $appId, 'reason' => 'CustomerId is null', 'data' => $data]);
+                $skippedNoCustomer++;
+
+                continue;
+            }
 
             try {
-                // Parse datetime values to MySQL format
                 $dateCreated = $this->parseDateTime($data['DateCreated'] ?? null);
                 $dateUpdated = $this->parseDateTime($data['DateUpdated'] ?? null);
                 $approvalDate = $this->parseDateTime($data['ApprovalDate'] ?? null);
 
-                // Log the full data object
-                $this->info("Data: " . json_encode([
-                    'Id' => $data['Id'] ?? null,
-                    'CustomerId' => $data['CustomerId'] ?? null,
-                    'CustomerProfessionId' => $data['CustomerProfessionId'] ?? null,
-                    'PaymentItemId' => $data['PaymentItemId'] ?? null,
-                    'RenewalPeriod' => $data['RenewalPeriod'] ?? null,
+                // Validate foreign keys
+                $customerProfessionId = $this->resolveCustomerProfessionId(
+                    $data['CustomerProfessionId'] ?? null,
+                    $data['CustomerId']
+                );
+
+                $customerId = $this->validateFk('customers', 'Id', $data['CustomerId']);
+
+                $paymentItemId = $this->validateFk('paymentitems', 'Id', $data['PaymentItemId'] ?? null);
+
+                $exists = DB::connection('mysql')
+                    ->table('customerapplication')
+                    ->where('Id', $appId)
+                    ->exists();
+
+                $record = [
+                    'CustomerId' => $customerId,
+                    'CustomerProfessionId' => $customerProfessionId,
+                    'PaymentItemId' => $paymentItemId,
+                    'PaymentMethodId' => $data['PaymentMethodId'] ?? null,
+                    'RenewalCategoryId' => $data['RenewalCategoryId'] ?? null,
+                    'RenewalPeriod' => $data['RenewalPeriod'],
+                    'RenewalStatusId' => $data['RenewalStatusId'] ?? null,
+                    'ApplicationTypeId' => $data['ApplicationTypeId'] ?? null,
+                    'RegisterCategoryId' => $data['RegisterCategoryId'] ?? null,
+                    'Cdpoints' => $data['Cdpoints'] ?? null,
+                    'Placement' => $data['Placement'] ?? null,
+                    'CertificateNumber' => $data['CertificateNumber'] ?? null,
+                    'AccountStatus' => $data['AccountStatus'] ?? 0,
                     'ApprovalStatus' => $approvalStatus,
-                    'DateCreated' => $dateCreated,
+                    'RegistrarStatus' => $data['RegistrarStatus'] ?? 0,
+                    'Comment' => $data['Comment'] ?? null,
+                    'RegistrationComment' => $data['RegistrationComment'] ?? null,
+                    'AccountComment' => $data['AccountComment'] ?? null,
+                    'ProofPaymentComment' => $data['ProofPaymentComment'] ?? null,
+                    'balance' => $data['balance'] ?? null,
                     'DateUpdated' => $dateUpdated,
                     'ApprovalDate' => $approvalDate,
-                ]));
-
-                // Validate and set null for missing foreign keys
-                $customerProfessionId = $data['CustomerProfessionId'];
-                if ($customerProfessionId) {
-                    $customerProfExists = DB::connection('mysql')->table('customerprofessions')
-                        ->where('Id', $customerProfessionId)
-                        ->exists();
-                    if (!$customerProfExists) {
-                        $this->warn("  Warning: CustomerProfessionId {$customerProfessionId} not found, setting to null");
-                        $customerProfessionId = null;
-                    }
-                }
-
-                // If CustomerProfessionId is still null, try to find it from CustomerProfessions table using CustomerId
-                if (!$customerProfessionId && ($data['CustomerId'] ?? null)) {
-                    $customerProf = DB::connection('mysql')->table('customerprofessions')
-                        ->where('CustomerId', $data['CustomerId'])
-                        ->first();
-                    if ($customerProf) {
-                        $customerProfessionId = $customerProf->Id;
-                        $this->info("  Found CustomerProfessionId from CustomerProfessions table: {$customerProfessionId}");
-                    }
-                }
-
-                $customerIdVal = $data['CustomerId'];
-                if ($customerIdVal) {
-                    $customerExists = DB::connection('mysql')->table('customers')
-                        ->where('Id', $customerIdVal)
-                        ->exists();
-                    if (!$customerExists) {
-                        $this->warn("  Warning: CustomerId {$customerIdVal} not found, setting to null");
-                        $customerIdVal = null;
-                    }
-                }
-
-                $paymentItemId = $data['PaymentItemId'];
-                if ($paymentItemId) {
-                    $paymentItemExists = DB::connection('mysql')->table('paymentitems')
-                        ->where('Id', $paymentItemId)
-                        ->exists();
-                    if (!$paymentItemExists) {
-                        $this->warn("  Warning: PaymentItemId {$paymentItemId} not found, setting to null");
-                        $paymentItemId = null;
-                    }
-                }
+                ];
 
                 if ($exists) {
-                    // Update with the final status from audit trail
                     DB::connection('mysql')->table('customerapplication')
                         ->where('Id', $appId)
-                        ->update([
-                            'CustomerId' => $customerIdVal,
-                            'CustomerProfessionId' => $customerProfessionId,
-                            'PaymentItemId' => $paymentItemId,
-                            'PaymentMethodId' => $data['PaymentMethodId'] ?? null,
-                            'RenewalCategoryId' => $data['RenewalCategoryId'] ?? null,
-                            'RenewalPeriod' => $data['RenewalPeriod'],
-                            'RenewalStatusId' => $data['RenewalStatusId'] ?? null,
-                            'ApplicationTypeId' => $data['ApplicationTypeId'] ?? null,
-                            'RegisterCategoryId' => $data['RegisterCategoryId'] ?? null,
-                            'Cdpoints' => $data['Cdpoints'] ?? null,
-                            'Placement' => $data['Placement'] ?? null,
-                            'CertificateNumber' => $data['CertificateNumber'] ?? null,
-                            'AccountStatus' => $data['AccountStatus'] ?? 0,
-                            'ApprovalStatus' => $approvalStatus,
-                            'RegistrarStatus' => $data['RegistrarStatus'] ?? 0,
-                            'Comment' => $data['Comment'] ?? null,
-                            'RegistrationComment' => $data['RegistrationComment'] ?? null,
-                            'AccountComment' => $data['AccountComment'] ?? null,
-                            'ProofPaymentComment' => $data['ProofPaymentComment'] ?? null,
-                            'balance' => $data['balance'] ?? null,
-                            'DateUpdated' => $dateUpdated,
-                            'ApprovalDate' => $approvalDate,
-                        ]);
-
-                    $this->info("  → Updated with final status: {$approvalStatus}");
+                        ->update($record);
+                    $this->info('  → Updated');
                     $updated++;
                 } else {
-                    DB::connection('mysql')->table('customerapplication')->insert([
-                        'Id' => $data['Id'],
-                        'CustomerId' => $customerIdVal,
-                        'CustomerProfessionId' => $customerProfessionId,
-                        'PaymentItemId' => $paymentItemId,
-                        'PaymentMethodId' => $data['PaymentMethodId'] ?? null,
-                        'RenewalCategoryId' => $data['RenewalCategoryId'] ?? null,
-                        'RenewalPeriod' => $data['RenewalPeriod'],
-                        'RenewalStatusId' => $data['RenewalStatusId'] ?? null,
-                        'ApplicationTypeId' => $data['ApplicationTypeId'] ?? null,
-                        'RegisterCategoryId' => $data['RegisterCategoryId'] ?? null,
-                        'Cdpoints' => $data['Cdpoints'] ?? null,
-                        'Placement' => $data['Placement'] ?? null,
-                        'CertificateNumber' => $data['CertificateNumber'] ?? null,
-                        'AccountStatus' => $data['AccountStatus'] ?? 0,
-                        'ApprovalStatus' => $approvalStatus,
-                        'RegistrarStatus' => $data['RegistrarStatus'] ?? 0,
-                        'Comment' => $data['Comment'] ?? null,
-                        'RegistrationComment' => $data['RegistrationComment'] ?? null,
-                        'AccountComment' => $data['AccountComment'] ?? null,
-                        'ProofPaymentComment' => $data['ProofPaymentComment'] ?? null,
-                        'balance' => $data['balance'] ?? null,
-                        'DateCreated' => $dateCreated,
-                        'DateUpdated' => $dateUpdated,
-                        'ApprovalDate' => $approvalDate,
-                    ]);
-
-                    $this->info("  → Inserted with final status: {$approvalStatus}");
+                    DB::connection('mysql')->table('customerapplication')
+                        ->insert(array_merge($record, [
+                            'Id' => $data['Id'],
+                            'DateCreated' => $dateCreated,
+                        ]));
+                    $this->info('  → Inserted');
                     $inserted++;
                 }
-
             } catch (\Exception $e) {
-                $this->error("Failed ID {$appId} - " . $e->getMessage());
-                $this->error("  Full data: " . json_encode($data, JSON_PRETTY_PRINT));
+                $this->error("Failed ID {$appId}: ".$e->getMessage());
             }
         }
 
-        $this->info("Done syncing CustomerApplication. Inserted: {$inserted}, Updated: {$updated}, Skipped (no CustomerId): {$skippedNoCustomerId}, Skipped (duplicates): {$skippedDuplicates}");
+        $this->info("Done. Inserted: {$inserted}, Updated: {$updated}, Skipped (no customer): {$skippedNoCustomer}");
 
         return Command::SUCCESS;
     }
 
-    /**
-     * Get approval priority for comparison
-     */
-    protected function getApprovalPriority(?string $status): int
+    protected function approvalPriority(?string $status): int
     {
-        $status = strtoupper($status ?? '');
-        switch ($status) {
-            case 'APPROVED':
-                return 3;
-            case 'AWAITING':
-                return 2;
-            case 'PENDING':
-                return 1;
-            default:
-                return 0;
+        return match (strtoupper($status ?? '')) {
+            'APPROVED' => 3,
+            'AWAITING' => 2,
+            'PENDING' => 1,
+            default => 0,
+        };
+    }
+
+    protected function resolveCustomerProfessionId(?int $id, ?int $customerId): ?int
+    {
+        if ($id) {
+            $exists = DB::connection('mysql')->table('customerprofessions')->where('Id', $id)->exists();
+            if ($exists) {
+                return $id;
+            }
+            $this->warn("  CustomerProfessionId {$id} not found, attempting lookup by CustomerId");
         }
+
+        if ($customerId) {
+            $row = DB::connection('mysql')->table('customerprofessions')->where('CustomerId', $customerId)->first();
+            if ($row) {
+                $this->info("  Resolved CustomerProfessionId={$row->Id} from CustomerId={$customerId}");
+
+                return $row->Id;
+            }
+        }
+
+        return null;
     }
 
-    /**
-     * Log skipped records to a file in public folder
-     */
-    protected function logSkippedRecord(string $type, array $data): void
+    protected function validateFk(string $table, string $column, mixed $value): mixed
     {
-        $filename = public_path('sync_skipped_' . $type . '_' . date('Y-m-d') . '.log');
-        $logEntry = json_encode($data) . "\n";
-        file_put_contents($filename, $logEntry, FILE_APPEND);
+        if (! $value) {
+            return null;
+        }
+
+        $exists = DB::connection('mysql')->table($table)->where($column, $value)->exists();
+
+        if (! $exists) {
+            $this->warn("  FK {$table}.{$column}={$value} not found, setting null");
+
+            return null;
+        }
+
+        return $value;
     }
 
-    /**
-     * Parse datetime string to MySQL format
-     */
+    protected function logSkipped(string $type, array $data): void
+    {
+        $file = public_path('sync_skipped_'.$type.'_'.date('Y-m-d').'.log');
+        file_put_contents($file, json_encode($data)."\n", FILE_APPEND);
+    }
+
     protected function parseDateTime(?string $value): ?string
     {
         if (empty($value)) {
@@ -306,11 +264,10 @@ class SyncCustomerApplicationFromAudit extends Command
         }
 
         try {
-            // Handle ISO 8601 format with timezone
             $date = new \DateTime($value);
+
             return $date->format('Y-m-d H:i:s');
-        } catch (\Exception $e) {
-            // If parsing fails, return null
+        } catch (\Exception) {
             return null;
         }
     }
