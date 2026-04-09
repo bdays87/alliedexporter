@@ -4,8 +4,12 @@ namespace App\Console\Commands;
 
 use App\Models\Applicationinvoice;
 use App\Models\Newcustomerapplication;
+use App\Models\Newcustomer;
+use App\Models\Newcurrency;
+use App\Models\Newinvoice;
 use Carbon\Carbon;
 use Illuminate\Console\Command;
+use Illuminate\Support\Str;
 
 class Importinvoices extends Command
 {
@@ -37,86 +41,122 @@ class Importinvoices extends Command
      */
     public function handle()
     {
-        // $invoices = Applicationinvoice::with('payments', 'customerapplication', 'currency')->whereIn('PaymentItemId', [33, 46, 45])->get();
-        $invoices = Applicationinvoice::with('payments', 'customerapplication', 'currency')
-            ->whereIn('PaymentItemId', [33, 46, 45])->get();
+        $chunkSize = 500;
+
+        // Pre-load lookup tables into memory — eliminates per-row SELECT queries
+        $existingIds = Newinvoice::pluck('id')->flip()->all();
+
+        $existingCustomerIds = Newcustomer::pluck('id')->flip()->all();
+
+        // Keyed by currency name for O(1) lookup
+        $currencies = Newcurrency::all()->keyBy('name');
+
+        // Only import invoices whose CustomerApplicationId exists in Newcustomerapplication
+        $importedApplicationIds = Newcustomerapplication::pluck('id')->flip()->all();
+
+        $total = Applicationinvoice::whereIn('PaymentItemId', [33, 46, 45])->count();
+        $this->info('Total Invoices Found: ' . $total);
+
         $counter = 0;
-        $this->info('Total Invoices: '.$invoices->count());
-        foreach ($invoices as $invoice) {
-            $id = $invoice->Id;
 
-            // Check if invoice already exists
-            $existingInvoice = \App\Models\Newinvoice::where('id', $id)->first();
-            if ($existingInvoice) {
-                $this->info('Invoice ' . $id . ' already exists. Skipping...');
-                continue;
-            }
+        Applicationinvoice::with('payments', 'customerapplication', 'currency')
+            ->whereIn('PaymentItemId', [33, 46, 45])
+            ->chunkById($chunkSize, function ($invoices) use (
+                &$counter, &$existingIds, $existingCustomerIds, $currencies, $importedApplicationIds
+            ) {
+                $rows = [];
 
-            $customer_id = $invoice->customerapplication->CustomerId;
+                foreach ($invoices as $invoice) {
+                    $id = $invoice->Id;
 
-            $checkcustomer = \App\Models\Newcustomer::where('id', $customer_id)->first();
-            if (! $checkcustomer) {
-                $this->error('Customer not found for Invoice ID: '.$invoice->Id.' and Customer ID: '.$customer_id);
+                    try {
+                        if (isset($existingIds[$id])) {
+                            continue;
+                        }
 
-                continue;
-            }
-            $checkcurrency = \App\Models\Newcurrency::where('name', $invoice->currency->Name)->first();
-            if (! $checkcurrency) {
-                $this->error('Currency not found for Invoice ID: '.$invoice->Id.' and Currency Name: '.$invoice->currency->Name);
+                        // Only import if the linked application was already imported
+                        if (!isset($importedApplicationIds[$invoice->CustomerApplicationId])) {
+                            $this->warn('Skipping Invoice ID: ' . $id . ' — Application ID ' . $invoice->CustomerApplicationId . ' not imported yet.');
+                            continue;
+                        }
 
-                continue;
-            }
-            $currency_id = $checkcurrency->id;
-            $description = $invoice->PaymentItemId == 33 ? 'Renewal' : ($invoice->PaymentItemId == 46 ? 'Renewal' : ($invoice->PaymentItemId == 45 ? 'New' : 'OTHER FEE'));
+                        if (!$invoice->customerapplication) {
+                            $this->error('Missing customerapplication relation for Invoice ID: ' . $id);
+                            continue;
+                        }
 
-            $customerapplication = Newcustomerapplication::with('customerprofession')->where('id', $invoice->CustomerApplicationId)->first();
+                        $customer_id = $invoice->customerapplication->CustomerId;
 
-            $invoice_number = 'INV-'.rand(100000, 999999);
-            $source = 'customerapplication';
-            $source_id = $invoice->CustomerApplicationId;
-            $amount = $invoice->TotalDue;
-            $total = $invoice->payments->sum('Amount');
-            $status = 'AWAITING';
-            $year = Carbon::parse($invoice->DateCreated)->year;
-            if ($amount == $total) {
-                $status = 'PAID';
-            }
-            // else {
-            //     $customerapplication->status = 'AWAITING';
-            //     $customerapplication->save();
-            //     $customerapplication->customerprofession->status = 'AWAITING_APP';
-            //     $customerapplication->customerprofession->save();
-            // }
-            $newinvoice = new \App\Models\Newinvoice;
-            $newinvoice->id = $id;
-            $newinvoice->customer_id = $customer_id;
-            $newinvoice->currency_id = $currency_id;
-            $newinvoice->description = $description;
-            $newinvoice->invoice_number = $invoice_number;
-            $newinvoice->source = $source;
-            $newinvoice->source_id = $source_id;
-            $newinvoice->amount = $amount;
-            $newinvoice->year = $year;
-            $newinvoice->uuid = \Str::uuid();
-            $newinvoice->status = $status;
+                        if (!isset($existingCustomerIds[$customer_id])) {
+                            $this->error('Customer ID ' . $customer_id . ' not found for Invoice ID: ' . $id);
+                            continue;
+                        }
 
+                        if (!$invoice->currency) {
+                            $this->error('Missing currency relation for Invoice ID: ' . $id);
+                            continue;
+                        }
 
-             // Handle C# DateTimeOffset format and convert to Laravel timestamp
-            $dateCreated = $this->parseDateTimeOffset($invoice->DateCreated);
-            // If DateCreated is DateTime.MinValue, try to use DateUpdated instead
-            if (! $dateCreated) {
-                $dateCreated = $this->parseDateTimeOffset($invoice->DateUpdated);
-            }
-            $newinvoice->created_at = $dateCreated ?? now();
-            $newinvoice->updated_at = $this->parseDateTimeOffset($invoice->DateUpdated);
+                        $currency = $currencies->get($invoice->currency->Name);
+                        if (!$currency) {
+                            $this->error('Currency "' . $invoice->currency->Name . '" not found for Invoice ID: ' . $id);
+                            continue;
+                        }
 
+                        $source      = in_array($invoice->PaymentItemId, [33, 46]) ? 'customerapplication' : 'customerprofession';
+                        $description = in_array($invoice->PaymentItemId, [33, 46]) ? 'Renewal' : ($invoice->PaymentItemId == 45 ? 'New' : 'OTHER FEE');
+                        $amount      = $invoice->TotalDue;
+                        $paid        = $invoice->payments->sum('Amount');
+                        $status      = $amount == $paid ? 'PAID' : 'AWAITING';
 
-            $newinvoice->save();
-            $counter++;
-            if ($counter % 100 == 0) {
-                $this->info('Imported Invoices: '.$counter);
-            }
-        }
+                        $dateCreated = $this->parseDateTimeOffset($invoice->DateCreated);
+                        if (!$dateCreated) {
+                            $dateCreated = $this->parseDateTimeOffset($invoice->DateUpdated);
+                        }
+
+                        $rows[] = [
+                            'id'             => $id,
+                            'customer_id'    => $customer_id,
+                            'currency_id'    => $currency->id,
+                            'description'    => $description,
+                            'invoice_number' => 'INV-' . str_pad($id, 6, '0', STR_PAD_LEFT),
+                            'source'         => $source,
+                            'source_id'      => $invoice->CustomerApplicationId,
+                            'amount'         => $amount,
+                            'year'           => $dateCreated ? Carbon::parse($dateCreated)->year : now()->year,
+                            'uuid'           => Str::uuid()->toString(),
+                            'status'         => $status,
+                            'created_at'     => $dateCreated ?? now(),
+                            'updated_at'     => $this->parseDateTimeOffset($invoice->DateUpdated),
+                        ];
+
+                        $existingIds[$id] = true;
+
+                    } catch (\Exception $e) {
+                        $this->error('Error processing Invoice ID: ' . $id . ' — ' . $e->getMessage());
+                    }
+                }
+
+                if (!empty($rows)) {
+                    try {
+                        Newinvoice::insertOrIgnore($rows);
+                        $counter += count($rows);
+                        $this->info('Inserted ' . count($rows) . ' invoices. Total so far: ' . $counter);
+                    } catch (\Exception $e) {
+                        $this->error('Bulk insert failed, falling back row-by-row: ' . $e->getMessage());
+                        foreach ($rows as $row) {
+                            try {
+                                Newinvoice::insertOrIgnore([$row]);
+                                $counter++;
+                            } catch (\Exception $ex) {
+                                $this->error('Failed Invoice ID ' . $row['id'] . ': ' . $ex->getMessage());
+                            }
+                        }
+                    }
+                }
+            }, 'Id');
+
+        $this->info('Total Imported Invoices: ' . $counter);
     }
 
 

@@ -18,15 +18,13 @@ class SyncCustomerApplicationFromAudit extends Command
         $year = (int) $this->option('year');
         $currentYear = (int) $this->option('current-year');
 
-        // For past years only import APPROVED; for current year import AWAITING + APPROVED
+        // Past years: APPROVED only. Current year: AWAITING + APPROVED.
         $allowedStatuses = ($year < $currentYear)
             ? ['APPROVED']
             : ['AWAITING', 'APPROVED'];
 
-        $this->info("Syncing CustomerApplication for year {$year} (allowed: ".implode(', ', $allowedStatuses).')...');
+        $this->info("Syncing CustomerApplication for year {$year} (allowed: " . implode(', ', $allowedStatuses) . ')...');
 
-        // Pull audit entries spanning the renewal year and the year before
-        // (renewals often start in Oct of the prior year)
         $audits = DB::connection('mysql')
             ->table('auditentries')
             ->where('EntityName', 'CustomerApplication')
@@ -36,8 +34,8 @@ class SyncCustomerApplicationFromAudit extends Command
 
         $this->info("Found {$audits->count()} audit records");
 
-        // Group all changes per application ID
-        $applicationStatuses = [];
+        // Group all changes per application ID, replaying history to get final state
+        $applicationChanges = [];
 
         foreach ($audits as $audit) {
             $data = json_decode($audit->Changes, true);
@@ -46,61 +44,56 @@ class SyncCustomerApplicationFromAudit extends Command
                 continue;
             }
 
-            $appId = $data['Id'];
-            $actionType = $audit->Action ?? 'UNKNOWN';
-
             // Only care about this renewal period
             if (($data['RenewalPeriod'] ?? null) != $year) {
                 continue;
             }
 
-            // Skip hard-deleted records
-            if (strtoupper($actionType) === 'DELETE') {
+            $appId = $data['Id'];
+
+            // Hard-deleted records are dropped entirely
+            if (strtoupper($audit->Action ?? '') === 'DELETE') {
                 $this->info("Application {$appId}: DELETED – skipping");
-                unset($applicationStatuses[$appId]);
+                unset($applicationChanges[$appId]);
 
                 continue;
             }
 
-            $timestamp = $audit->Timestamp ?? $audit->timestamp ?? now();
-
-            $applicationStatuses[$appId][] = [
+            $applicationChanges[$appId][] = [
                 'data' => $data,
-                'timestamp' => $timestamp,
-                'action' => $actionType,
+                'timestamp' => $audit->Timestamp ?? now(),
+                'action' => $audit->Action ?? 'UNKNOWN',
             ];
         }
 
-        $this->info('Found '.count($applicationStatuses).' unique applications (excluding deleted)');
+        $this->info('Found ' . count($applicationChanges) . ' unique applications (excluding deleted)');
 
-        // One application per customer per renewal period
-        // Key: customerId_year → best appId
-        $customerYearMap = [];
+        // Resolve the single winning application per customer per renewal period.
+        // Priority: APPROVED > AWAITING > PENDING > other.
+        // We also check the DB so re-runs don't create duplicates.
+        $customerYearMap = []; // customerId_year => appId
 
-        // First pass: resolve which single app wins per customer
-        foreach ($applicationStatuses as $appId => $statusChanges) {
-            $finalData = end($statusChanges)['data'];
+        foreach ($applicationChanges as $appId => $changes) {
+            $finalData = end($changes)['data'];
             $approvalStatus = strtoupper($finalData['ApprovalStatus'] ?? 'UNKNOWN');
 
-            // Skip statuses not allowed for this year
             if (! in_array($approvalStatus, $allowedStatuses)) {
                 continue;
             }
 
             $customerId = $finalData['CustomerId'] ?? null;
+
             if (! $customerId) {
                 continue;
             }
 
-            $key = $customerId.'_'.$year;
+            $key = $customerId . '_' . $year;
 
             if (! isset($customerYearMap[$key])) {
                 $customerYearMap[$key] = $appId;
             } else {
-                // Keep the one with the higher approval priority
                 $existingId = $customerYearMap[$key];
-                $existingFinal = end($applicationStatuses[$existingId])['data'];
-                $existingStatus = strtoupper($existingFinal['ApprovalStatus'] ?? '');
+                $existingStatus = strtoupper(end($applicationChanges[$existingId])['data']['ApprovalStatus'] ?? '');
 
                 if ($this->approvalPriority($approvalStatus) > $this->approvalPriority($existingStatus)) {
                     $this->info("  Replacing app {$existingId} ({$existingStatus}) with {$appId} ({$approvalStatus}) for customer {$customerId}");
@@ -111,15 +104,30 @@ class SyncCustomerApplicationFromAudit extends Command
             }
         }
 
+        // Also enforce uniqueness against what is already in the DB.
+        // If a customer already has an app for this year in the DB that we are NOT about to upsert,
+        // remove those stale duplicates.
+        $winningAppIds = array_values($customerYearMap);
+
+        if (! empty($winningAppIds)) {
+            $deleted = DB::connection('mysql')
+                ->table('customerapplication')
+                ->where('RenewalPeriod', $year)
+                ->whereNotIn('Id', $winningAppIds)
+                ->delete();
+
+            if ($deleted > 0) {
+                $this->warn("  Removed {$deleted} stale duplicate application(s) from DB for year {$year}");
+            }
+        }
+
         $inserted = 0;
         $updated = 0;
         $skippedNoCustomer = 0;
-        $skippedStatus = 0;
 
         foreach ($customerYearMap as $key => $appId) {
-            $statusChanges = $applicationStatuses[$appId];
-            $finalEntry = end($statusChanges);
-            $data = $finalEntry['data'];
+            $changes = $applicationChanges[$appId];
+            $data = end($changes)['data'];
             $approvalStatus = strtoupper($data['ApprovalStatus'] ?? 'UNKNOWN');
 
             $this->info("Application {$appId}: status={$approvalStatus}, customer={$data['CustomerId']}");
@@ -137,14 +145,12 @@ class SyncCustomerApplicationFromAudit extends Command
                 $dateUpdated = $this->parseDateTime($data['DateUpdated'] ?? null);
                 $approvalDate = $this->parseDateTime($data['ApprovalDate'] ?? null);
 
-                // Validate foreign keys
                 $customerProfessionId = $this->resolveCustomerProfessionId(
                     $data['CustomerProfessionId'] ?? null,
                     $data['CustomerId']
                 );
 
                 $customerId = $this->validateFk('customers', 'Id', $data['CustomerId']);
-
                 $paymentItemId = $this->validateFk('paymentitems', 'Id', $data['PaymentItemId'] ?? null);
 
                 $exists = DB::connection('mysql')
@@ -193,7 +199,7 @@ class SyncCustomerApplicationFromAudit extends Command
                     $inserted++;
                 }
             } catch (\Exception $e) {
-                $this->error("Failed ID {$appId}: ".$e->getMessage());
+                $this->error("Failed ID {$appId}: " . $e->getMessage());
             }
         }
 
@@ -216,14 +222,17 @@ class SyncCustomerApplicationFromAudit extends Command
     {
         if ($id) {
             $exists = DB::connection('mysql')->table('customerprofessions')->where('Id', $id)->exists();
+
             if ($exists) {
                 return $id;
             }
+
             $this->warn("  CustomerProfessionId {$id} not found, attempting lookup by CustomerId");
         }
 
         if ($customerId) {
             $row = DB::connection('mysql')->table('customerprofessions')->where('CustomerId', $customerId)->first();
+
             if ($row) {
                 $this->info("  Resolved CustomerProfessionId={$row->Id} from CustomerId={$customerId}");
 
@@ -253,8 +262,8 @@ class SyncCustomerApplicationFromAudit extends Command
 
     protected function logSkipped(string $type, array $data): void
     {
-        $file = public_path('sync_skipped_'.$type.'_'.date('Y-m-d').'.log');
-        file_put_contents($file, json_encode($data)."\n", FILE_APPEND);
+        $file = public_path('sync_skipped_' . $type . '_' . date('Y-m-d') . '.log');
+        file_put_contents($file, json_encode($data) . "\n", FILE_APPEND);
     }
 
     protected function parseDateTime(?string $value): ?string
@@ -264,9 +273,7 @@ class SyncCustomerApplicationFromAudit extends Command
         }
 
         try {
-            $date = new \DateTime($value);
-
-            return $date->format('Y-m-d H:i:s');
+            return (new \DateTime($value))->format('Y-m-d H:i:s');
         } catch (\Exception) {
             return null;
         }

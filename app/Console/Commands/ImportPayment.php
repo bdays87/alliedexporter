@@ -4,9 +4,11 @@ namespace App\Console\Commands;
 
 use App\Models\Applicationpayment;
 use App\Models\Newcurrency;
+use App\Models\Newcustomer;
+use App\Models\Newcustomerapplication;
 use App\Models\NewPayment;
 use Illuminate\Console\Command;
-use Str;
+use Illuminate\Support\Str;
 use Carbon\Carbon;
 class ImportPayment extends Command
 {
@@ -16,83 +18,111 @@ class ImportPayment extends Command
 
     public function handle()
     {
-        $payments = Applicationpayment::with(['applicationinvoice.customerapplication', 'paymentchannel', 'currency'])->get();
+        $chunkSize = 500;
 
-        $this->info('Total Payments: '.$payments->count());
+        // Pre-load lookup tables into memory — eliminates per-row SELECT queries
+        $existingIds = NewPayment::pluck('id')->flip()->all();
+
+        $currencies = Newcurrency::all()->keyBy('name');
+
+        $existingCustomerIds = Newcustomer::pluck('id')->flip()->all();
+
+        // Only import payments linked to applications already imported
+        $importedApplicationIds = Newcustomerapplication::pluck('id')->flip()->all();
+
+        $total = Applicationpayment::count();
+        $this->info('Total Payments Found: ' . $total);
+
         $counter = 0;
 
-        foreach ($payments as $payment) {
-            // Check if payment already exists
-            $existingPayment = NewPayment::where('id', $payment->Id)->first();
-            if ($existingPayment) {
-                $this->info('Payment ' . $payment->Id . ' already exists. Skipping...');
-                continue;
-            }
+        Applicationpayment::with(['applicationinvoice.customerapplication', 'paymentchannel', 'currency'])
+            ->chunkById($chunkSize, function ($payments) use (
+                &$counter, &$existingIds, $currencies, $existingCustomerIds, $importedApplicationIds
+            ) {
+                $rows = [];
 
-            if (! $payment->applicationinvoice) {
-                $this->error('Invoice missing for Payment ID: '.$payment->Id);
+                foreach ($payments as $payment) {
+                    $id = $payment->Id;
 
-                continue;
-            }
+                    try {
+                        if (isset($existingIds[$id])) {
+                            continue;
+                        }
 
-            // Get customer from invoice
-            $customer_id = $payment->applicationinvoice->customerapplication->CustomerId ?? null;
-            if (! $customer_id) {
-                $this->error('Customer missing for Payment ID: '.$payment->Id);
+                        if (!$payment->applicationinvoice) {
+                            $this->error('Invoice missing for Payment ID: ' . $id);
+                            continue;
+                        }
 
-                continue;
-            }
+                        $appId = $payment->applicationinvoice->CustomerApplicationId ?? null;
+                        if (!$appId || !isset($importedApplicationIds[$appId])) {
+                            $this->warn('Skipping Payment ID: ' . $id . ' — Application ID ' . $appId . ' not imported yet.');
+                            continue;
+                        }
 
-            // Currency mapping
-            $currency = Newcurrency::where('name', $payment->currency->Name ?? null)->first();
-            if (! $currency) {
-                $this->error('Currency not found for Payment ID: '.$payment->Id);
+                        $customer_id = $payment->applicationinvoice->customerapplication->CustomerId ?? null;
+                        if (!$customer_id || !isset($existingCustomerIds[$customer_id])) {
+                            $this->error('Customer missing for Payment ID: ' . $id);
+                            continue;
+                        }
 
-                continue;
-            }
+                        if (!$payment->currency) {
+                            $this->error('Currency relation missing for Payment ID: ' . $id);
+                            continue;
+                        }
 
-            // Convert amount (LONGTEXT → decimal)
-            $amount = floatval($payment->Amount);
-            // RenewalStatusId
-            $paymentstatus = 'PENDING';
-            // $this->info('check Renewalstatus: '.$payment->applicationinvoice->customerapplication->RenewalStatusId);
-            // if ($payment->applicationinvoice->customerapplication->RenewalStatusId == 1) {
-            //     $paymentstatus = 'UTILIZED';
-            // } else {
-            //     $paymentstatus = 'PENDING';
-            // }
-            // Create suspense record
-            $suspense = new NewPayment;
-            $suspense->id = $payment->Id;
-            $suspense->customer_id = $customer_id;
-            $suspense->currency_id = $currency->id;
-            $suspense->uuid = Str::uuid();
-            $suspense->source = $payment->paymentchannel->Name ?? 'Cash';
-            $suspense->source_id = $payment->Id;
-            $suspense->amount = $amount;
-            $suspense->createdby=1;
-            $suspense->status = $paymentstatus; // UTILIZEDS
+                        $currency = $currencies->get($payment->currency->Name);
+                        if (!$currency) {
+                            $this->error('Currency "' . $payment->currency->Name . '" not found for Payment ID: ' . $id);
+                            continue;
+                        }
 
+                        $dateCreated = $this->parseDateTimeOffset($payment->DateCreated);
+                        if (!$dateCreated) {
+                            $dateCreated = $this->parseDateTimeOffset($payment->DateUpdated);
+                        }
 
-          // Handle C# DateTimeOffset format and convert to Laravel timestamp
-            $dateCreated = $this->parseDateTimeOffset($payment->DateCreated);
-            // If DateCreated is DateTime.MinValue, try to use DateUpdated instead
-            if (! $dateCreated) {
-                $dateCreated = $this->parseDateTimeOffset($payment->DateUpdated);
-            }
-            $suspense->created_at = $dateCreated ?? now();
-            $suspense->updated_at = $this->parseDateTimeOffset($payment->DateUpdated);
+                        $rows[] = [
+                            'id'          => $id,
+                            'customer_id' => $customer_id,
+                            'currency_id' => $currency->id,
+                            'uuid'        => Str::uuid()->toString(),
+                            'source'      => $payment->paymentchannel->Name ?? 'Cash',
+                            'source_id'   => $id,
+                            'amount'      => floatval($payment->Amount),
+                            'createdby'   => 1,
+                            'status'      => 'PENDING',
+                            'created_at'  => $dateCreated ?? now(),
+                            'updated_at'  => $this->parseDateTimeOffset($payment->DateUpdated),
+                        ];
 
+                        $existingIds[$id] = true;
 
-            $suspense->save();
+                    } catch (\Exception $e) {
+                        $this->error('Error processing Payment ID: ' . $id . ' — ' . $e->getMessage());
+                    }
+                }
 
-            $counter++;
-            if ($counter % 100 == 0) {
-                $this->info('Imported Payments: '.$counter);
-            }
-        }
+                if (!empty($rows)) {
+                    try {
+                        NewPayment::insertOrIgnore($rows);
+                        $counter += count($rows);
+                        $this->info('Inserted ' . count($rows) . ' payments. Total so far: ' . $counter);
+                    } catch (\Exception $e) {
+                        $this->error('Bulk insert failed, falling back row-by-row: ' . $e->getMessage());
+                        foreach ($rows as $row) {
+                            try {
+                                NewPayment::insertOrIgnore([$row]);
+                                $counter++;
+                            } catch (\Exception $ex) {
+                                $this->error('Failed Payment ID ' . $row['id'] . ': ' . $ex->getMessage());
+                            }
+                        }
+                    }
+                }
+            }, 'Id');
 
-        $this->info("✅ Import completed. Total imported: $counter");
+        $this->info('Import completed. Total imported: ' . $counter);
     }
 
 

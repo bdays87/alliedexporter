@@ -38,32 +38,36 @@ class ImportEmployement extends Command
          $this->info('Total Customer Employement Found: '.$oldcustoer->count());
         $counter = 0;
         foreach ($oldcustoer as $student) {
+            try {
+                // Check if student already exists by ID
+                $existingStudent = NewCustomerEmployement::where('id', $student->Id)->first();
+                if ($existingStudent) {
+                    $this->info('Employement ' . $student->Id . ' already exists. Skipping...');
+                    continue;
+                }
 
-         // Check if student already exists by ID
-            $existingStudent = NewCustomerEmployement::where('id', $student->Id)->first();
-            if ($existingStudent) {
-                $this->info('Employement ' . $student->Id . ' already exists. Skipping...');
-                continue;
+                $new = new NewCustomerEmployement;
+                $new->id = $student->Id;
+                $new->customer_id = $student->CustomerId;
+                $new->companyname = $student->Name;
+                $new->position = $student->JobTitle;
+                $new->start_date = $student->CommencementData;
+                $new->end_date = null;
+                $new->phone = $student->Phone;
+                $new->email = $student->Email;
+                $new->address = $student->Address;
+                $new->contactperson = $student->ContactPerson;
+                $new->created_at = now();
+                $new->updated_at = now();
+
+                $new->save();
+
+                $counter++;
+                $customerName = $student->customer ? $student->customer->fullname : 'Customer ID ' . $student->CustomerId;
+                $this->info("Employement {$counter} imported: {$customerName}");
+            } catch (\Exception $e) {
+                $this->error('Error processing Employment ID: ' . $student->Id . ' — ' . $e->getMessage());
             }
-
-            $new = new NewCustomerEmployement;
-            $new->id = $student->Id;
-            $new->customer_id = $student->CustomerId;
-            $new->companyname = $student->Name;
-            $new->position = $student->JobTitle;
-            $new->start_date = $student->CommencementData;;
-            $new->end_date = null;
-            $new->phone = $student->Phone;
-            $new->email = $student->Email;
-            $new->address = $student->Address;
-            $new->contactperson = $student->ContactPerson;
-            $new->created_at = now();
-            $new->updated_at =  now();
-
-            $new->save();
-
-              $counter++;
-            $this->info("Employement {$counter} imported: {$student->customer->fullname}");
         }
     }
 

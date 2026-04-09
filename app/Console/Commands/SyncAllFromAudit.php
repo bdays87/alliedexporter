@@ -7,31 +7,36 @@ use Illuminate\Console\Command;
 class SyncAllFromAudit extends Command
 {
     protected $signature = 'sync:all
-                            {--year=2026 : Sync a single specific year}
-                            {--all-years : Sync all years from --from-year up to --year}
-                            {--from-year=2020 : Start year when using --all-years}';
+                            {--current-year=2026 : The current renewal period (AWAITING+APPROVED). All prior years get APPROVED only.}
+                            {--from-year=2020 : Earliest year to sync}
+                            {--only-year= : Sync a single specific year instead of the full range}';
 
-    protected $description = 'Sync customerapplication, invoices and payments from auditentries. Past years: APPROVED only. Current year: AWAITING + APPROVED.';
+    protected $description = 'Sync all customer applications, invoices and payments from audit entries.
+                              Years before --current-year: APPROVED only.
+                              --current-year: AWAITING + APPROVED.';
 
     public function handle(): int
     {
-        $currentYear = (int) $this->option('year');
-        $allYears = (bool) $this->option('all-years');
+        $currentYear = (int) $this->option('current-year');
         $fromYear = (int) $this->option('from-year');
+        $onlyYear = $this->option('only-year');
 
-        $years = $allYears
-            ? range($fromYear, $currentYear)
-            : [$currentYear];
+        $years = $onlyYear !== null
+            ? [(int) $onlyYear]
+            : range($fromYear, $currentYear);
 
         $this->info('========================================');
         $this->info('Starting full sync');
-        $this->info('Years: '.implode(', ', $years));
-        $this->info("Current year (AWAITING+APPROVED): {$currentYear}");
-        $this->info('Past years (APPROVED only): all others');
+        $this->info('Years: ' . implode(', ', $years));
+        $this->info("Current renewal period (AWAITING+APPROVED): {$currentYear}");
+        $this->info('Past years (APPROVED only): ' . $fromYear . ' – ' . ($currentYear - 1));
         $this->info('========================================');
 
         foreach ($years as $year) {
-            $this->info("\n======== Year {$year} ========");
+            $isPast = $year < $currentYear;
+            $label = $isPast ? 'APPROVED only' : 'AWAITING + APPROVED';
+
+            $this->info("\n======== Year {$year} [{$label}] ========");
 
             $this->info("\n[1/3] Syncing CustomerApplication for {$year}...");
             $this->call(SyncCustomerApplicationFromAudit::class, [

@@ -22,7 +22,7 @@ class SyncApplicationPaymentFromAudit extends Command
             ? ['APPROVED']
             : ['AWAITING', 'APPROVED'];
 
-        $this->info("Syncing ApplicationPayment for year {$year} (apps: ".implode(', ', $allowedStatuses).')...');
+        $this->info("Syncing ApplicationPayment for year {$year} (apps: " . implode(', ', $allowedStatuses) . ')...');
 
         $audits = DB::connection('mysql')
             ->table('auditentries')
@@ -33,7 +33,7 @@ class SyncApplicationPaymentFromAudit extends Command
 
         $this->info("Found {$audits->count()} audit records");
 
-        // Group all changes per payment ID
+        // Replay audit history to get the final state of each payment
         $paymentChanges = [];
 
         foreach ($audits as $audit) {
@@ -45,11 +45,22 @@ class SyncApplicationPaymentFromAudit extends Command
 
             $paymentChanges[$data['Id']][] = [
                 'data' => $data,
-                'timestamp' => $audit->Timestamp ?? $audit->timestamp ?? now(),
+                'timestamp' => $audit->Timestamp ?? now(),
             ];
         }
 
-        $this->info('Found '.count($paymentChanges).' unique payments');
+        $this->info('Found ' . count($paymentChanges) . ' unique payments in audit');
+
+        // Load valid invoice IDs for this year in one query to avoid N+1
+        // An invoice is valid if its application is in the correct year + allowed status
+        $validInvoiceIds = DB::connection('mysql')
+            ->table('applicationinvoices as i')
+            ->join('customerapplication as a', 'a.Id', '=', 'i.CustomerApplicationId')
+            ->where('a.RenewalPeriod', $year)
+            ->whereIn('a.ApprovalStatus', $allowedStatuses)
+            ->pluck('i.Id')
+            ->flip()
+            ->all();
 
         $inserted = 0;
         $updated = 0;
@@ -58,40 +69,15 @@ class SyncApplicationPaymentFromAudit extends Command
         foreach ($paymentChanges as $paymentId => $changes) {
             $finalData = end($changes)['data'];
 
-            if (! isset($finalData['ApplicationInvoiceId'])) {
+            $invoiceId = $finalData['ApplicationInvoiceId'] ?? null;
+
+            if (! $invoiceId || ! isset($validInvoiceIds[$invoiceId])) {
                 $skippedNoInvoice++;
 
                 continue;
             }
 
-            // Verify the invoice exists
-            $invoice = DB::connection('mysql')
-                ->table('applicationinvoices')
-                ->where('Id', $finalData['ApplicationInvoiceId'])
-                ->first();
-
-            if (! $invoice) {
-                $skippedNoInvoice++;
-
-                continue;
-            }
-
-            // Verify the linked application belongs to this renewal period
-            // and has an allowed status
-            $application = DB::connection('mysql')
-                ->table('customerapplication')
-                ->where('Id', $invoice->CustomerApplicationId)
-                ->where('RenewalPeriod', $year)
-                ->whereIn('ApprovalStatus', $allowedStatuses)
-                ->first();
-
-            if (! $application) {
-                $skippedNoInvoice++;
-
-                continue;
-            }
-
-            $this->info("Payment {$paymentId}: invoice={$finalData['ApplicationInvoiceId']}, app={$invoice->CustomerApplicationId}");
+            $this->info("Payment {$paymentId}: invoice={$invoiceId}");
 
             try {
                 $dateCreated = $this->parseDateTime($finalData['DateCreated'] ?? null);
@@ -104,7 +90,7 @@ class SyncApplicationPaymentFromAudit extends Command
                     ->exists();
 
                 $record = [
-                    'ApplicationInvoiceId' => $finalData['ApplicationInvoiceId'],
+                    'ApplicationInvoiceId' => $invoiceId,
                     'ExchangeRateId' => $finalData['ExchangeRateId'] ?? null,
                     'PaymentMethodId' => $finalData['PaymentMethodId'] ?? null,
                     'PaymentChannelId' => $finalData['PaymentChannelId'] ?? null,
@@ -136,13 +122,50 @@ class SyncApplicationPaymentFromAudit extends Command
                     $inserted++;
                 }
             } catch (\Exception $e) {
-                $this->error("Failed payment {$paymentId}: ".$e->getMessage());
+                $this->error("Failed payment {$paymentId}: " . $e->getMessage());
             }
         }
+
+        // Remove any payments in the DB that are now orphaned
+        // (their invoice was cleaned up or never belonged to this year)
+        $this->cleanOrphanedPayments($year, $allowedStatuses);
 
         $this->info("Done. Inserted: {$inserted}, Updated: {$updated}, Skipped (no invoice/app): {$skippedNoInvoice}");
 
         return Command::SUCCESS;
+    }
+
+    /**
+     * Delete payments whose invoice no longer belongs to a valid application for this year.
+     */
+    protected function cleanOrphanedPayments(int $year, array $allowedStatuses): void
+    {
+        $validInvoiceIds = DB::connection('mysql')
+            ->table('applicationinvoices as i')
+            ->join('customerapplication as a', 'a.Id', '=', 'i.CustomerApplicationId')
+            ->where('a.RenewalPeriod', $year)
+            ->whereIn('a.ApprovalStatus', $allowedStatuses)
+            ->pluck('i.Id');
+
+        if ($validInvoiceIds->isEmpty()) {
+            return;
+        }
+
+        // Find payments for this year's invoices that point to an invoice not in the valid set
+        $orphaned = DB::connection('mysql')
+            ->table('applicationpayments')
+            ->whereIn('ApplicationInvoiceId', function ($q) use ($year, $allowedStatuses) {
+                $q->select('i.Id')
+                    ->from('applicationinvoices as i')
+                    ->join('customerapplication as a', 'a.Id', '=', 'i.CustomerApplicationId')
+                    ->where('a.RenewalPeriod', $year);
+            })
+            ->whereNotIn('ApplicationInvoiceId', $validInvoiceIds)
+            ->delete();
+
+        if ($orphaned > 0) {
+            $this->warn("  Removed {$orphaned} orphaned payment(s) for year {$year}");
+        }
     }
 
     protected function parseDateTime(?string $value): ?string
