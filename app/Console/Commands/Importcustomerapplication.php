@@ -8,6 +8,7 @@ use App\Models\Newcustomerapplication;
 use App\Models\Newcustomerprofession;
 use Illuminate\Console\Command;
 use Carbon\Carbon;
+use Illuminate\Support\Str;
 class Importcustomerapplication extends Command
 {
     /**
@@ -29,95 +30,128 @@ class Importcustomerapplication extends Command
      */
     public function handle()
     {
-       $customerapplications = Customerapplication::with('customer')
-                                ->whereIn('ApprovalStatus', ['AWAITING', 'APPROVED'])
-                                ->get();
+        $chunkSize   = 500;
+        $currentYear = (int) now()->year;
 
-        foreach ($customerapplications as $customerapplication) {
-            // Check if application already exists
-            $existingApplication = Newcustomerapplication::where('id', $customerapplication->Id)->first();
-            if ($existingApplication) {
-                $this->info('Application ' . $customerapplication->Id . ' already exists. Skipping...');
-                continue;
-            }
+        // Pre-load all lookup tables into memory — eliminates per-row SELECT queries
+        $existingIds         = Newcustomerapplication::pluck('id')->flip()->all();
+        $existingCustomerIds = Newcustomer::pluck('id')->flip()->all();
+        $customerprofessions = Newcustomerprofession::all()->keyBy('id');
 
-            $customer = Newcustomer::where('id', $customerapplication->CustomerId)->first();
-            if (! $customer) {
-                $this->error('Customer not found for application id: '.$customerapplication->Id);
+        $total = Customerapplication::whereIn('ApprovalStatus', ['AWAITING', 'APPROVED'])
+            ->where('RenewalPeriod', '>=', 2025)
+            ->count();
+        $this->info('Total Applications Found (RenewalPeriod >= 2025): ' . $total);
 
-                continue;
-            }
+        $counter = 0;
 
-            $customerprofession = Newcustomerprofession::where('id', $customerapplication->CustomerProfessionId)->first();
-            if (! $customerprofession) {
-                $this->error('Customer Profession not found for application id: '.$customerapplication->Id);
+        Customerapplication::whereIn('ApprovalStatus', ['AWAITING', 'APPROVED'])
+            ->where('RenewalPeriod', '>=', 2025)
+            ->chunkById($chunkSize, function ($customerapplications) use (
+                &$counter, &$existingIds, $existingCustomerIds, $customerprofessions, $currentYear
+            ) {
+                $rows = [];
 
-                continue;
-            }
+                foreach ($customerapplications as $customerapplication) {
+                    $id = $customerapplication->Id;
 
-            // Default status
-            $status = 'PENDING';
-            $registration = 0;
-            $accounts = 0;
+                    try {
+                        // Skip fully pending applications (nothing approved at all)
+                        if ($customerapplication->RegistrarStatus == 0 && $customerapplication->AccountStatus == 0 && $customerapplication->ApprovalStatus == 'PENDING') {
+                            $this->warn('Skipping PENDING application ID: ' . $id);
+                            continue;
+                        }
 
-            // Status logic
-             if ($customerapplication->RegistrarStatus == 0 && $customerapplication->AccountStatus == 0 && $customerapplication->ApprovalStatus == 'PENDING') {
-                $status = 'PENDING';
-                $registration = 0;
-                $accounts = 0;
-             }elseif ($customerapplication->RegistrarStatus == 0 && $customerapplication->AccountStatus == 0 && $customerapplication->ApprovalStatus == 'AWAITING') {
-                $status = 'PENDING';
-                $registration = 0;
-                $accounts = 0;
-            } elseif ($customerapplication->RegistrarStatus == 1 && $customerapplication->AccountStatus == 0 && $customerapplication->ApprovalStatus == 'AWAITING') {
-                $status = 'AWAITING';
-                $registration = 1;
-                $accounts = 0;
-            } elseif ($customerapplication->RegistrarStatus == 1 && $customerapplication->AccountStatus == 1 && $customerapplication->ApprovalStatus == 'AWAITING') {
-                $status = 'AWAITING';
-                 $registration = 1;
-                 $accounts = 1;
-            } else {
-                $status = 'APPROVED';
-                 $registration = 1;
-                 $accounts = 1;
-            }
+                        // For 2025 up to last year: APPROVED only
+                        if ($customerapplication->RenewalPeriod >= 2025 && $customerapplication->RenewalPeriod < $currentYear && $customerapplication->ApprovalStatus !== 'APPROVED') {
+                            $this->warn('Skipping non-APPROVED application ID: ' . $id . ' (RenewalPeriod: ' . $customerapplication->RenewalPeriod . ', Status: ' . $customerapplication->ApprovalStatus . ')');
+                            continue;
+                        }
 
-            $this->info('Importing application id: '.$customerapplication->Id.' with status: '.$status);
-           $apptype;
-           if($customerapplication->RenewalCategoryId == 4){
-              $apptype = 3;
-           }
-           else{
-                $apptype = $customerapplication->ApplicationTypeId;
-           }
+                        // For current year: AWAITING and APPROVED only
+                        if ($customerapplication->RenewalPeriod == $currentYear && !in_array($customerapplication->ApprovalStatus, ['AWAITING', 'APPROVED'])) {
+                            $this->warn('Skipping application ID: ' . $id . ' (RenewalPeriod: ' . $customerapplication->RenewalPeriod . ', Status: ' . $customerapplication->ApprovalStatus . ')');
+                            continue;
+                        }
 
-            // Create new application
-            $newcustomerapplication = new Newcustomerapplication;
-            $newcustomerapplication->id = $customerapplication->Id;
-            $newcustomerapplication->customer_id = $customer->id;
-            $newcustomerapplication->customerprofession_id = $customerprofession->id;
-            $newcustomerapplication->status = $status;
-            $newcustomerapplication->registration = $registration;
-            $newcustomerapplication->accounts = $accounts;
-            $newcustomerapplication->certificate_number = $customerapplication->CertificateNumber;
-            $newcustomerapplication->certificate_expiry_date = $customerapplication->RenewalPeriod.'-12-31';
-            $newcustomerapplication->year = $customerapplication->RenewalPeriod;
-            $newcustomerapplication->registertype_id = $customerprofession->registertype_id ?? 1;
-            $newcustomerapplication->registration_date = $customerapplication->DateCreated;
-            $newcustomerapplication->applicationtype_id = $apptype;
-            $newcustomerapplication->uuid = \Str::uuid();
+                        if (isset($existingIds[$id])) {
+                            continue;
+                        }
 
-            // Handle C# DateTimeOffset format and convert to Laravel timestamp
-            $dateCreated = $this->parseDateTimeOffset($customerapplication->DateCreated);
-            // If DateCreated is DateTime.MinValue, try to use DateUpdated instead
-            if (! $dateCreated) {
-                $dateCreated = $this->parseDateTimeOffset($customerapplication->DateUpdated);
-            }
-            $newcustomerapplication->created_at = $dateCreated ?? now();
-            $newcustomerapplication->updated_at = $this->parseDateTimeOffset($customerapplication->DateUpdated);
-            $newcustomerapplication->save();
-        }
+                        if (!isset($existingCustomerIds[$customerapplication->CustomerId])) {
+                            $this->error('Customer not found for application ID: ' . $id);
+                            continue;
+                        }
+
+                        $customerprofession = $customerprofessions->get($customerapplication->CustomerProfessionId);
+                        if (!$customerprofession) {
+                            $this->error('Customer Profession not found for application ID: ' . $id);
+                            continue;
+                        }
+
+                        // Resolve status
+                        if ($customerapplication->RegistrarStatus == 1 && $customerapplication->AccountStatus == 1 && $customerapplication->ApprovalStatus == 'AWAITING') {
+                            $status = 'AWAITING'; $registration = 1; $accounts = 1;
+                        } elseif ($customerapplication->RegistrarStatus == 1 && $customerapplication->AccountStatus == 0 && $customerapplication->ApprovalStatus == 'AWAITING') {
+                            $status = 'AWAITING'; $registration = 1; $accounts = 0;
+                        } elseif ($customerapplication->ApprovalStatus === 'APPROVED') {
+                            $status = 'APPROVED'; $registration = 1; $accounts = 1;
+                        } else {
+                            $status = 'PENDING'; $registration = 0; $accounts = 0;
+                        }
+
+                        $apptype = $customerapplication->RenewalCategoryId == 4 ? 3 : $customerapplication->ApplicationTypeId;
+
+                        $dateCreated = $this->parseDateTimeOffset($customerapplication->DateCreated);
+                        if (!$dateCreated) {
+                            $dateCreated = $this->parseDateTimeOffset($customerapplication->DateUpdated);
+                        }
+
+                        $rows[] = [
+                            'id'                      => $id,
+                            'customer_id'             => $customerapplication->CustomerId,
+                            'customerprofession_id'   => $customerprofession->id,
+                            'status'                  => $status,
+                            'registration'            => $registration,
+                            'accounts'                => $accounts,
+                            'certificate_number'      => $customerapplication->CertificateNumber,
+                            'certificate_expiry_date' => $customerapplication->RenewalPeriod . '-12-31',
+                            'year'                    => $customerapplication->RenewalPeriod,
+                            'registertype_id'         => $customerprofession->registertype_id ?? 1,
+                            'registration_date'       => $customerapplication->DateCreated,
+                            'applicationtype_id'      => $apptype,
+                            'uuid'                    => Str::uuid()->toString(),
+                            'created_at'              => $dateCreated ?? now(),
+                            'updated_at'              => $this->parseDateTimeOffset($customerapplication->DateUpdated),
+                        ];
+
+                        $existingIds[$id] = true;
+
+                    } catch (\Exception $e) {
+                        $this->error('Error processing Application ID: ' . $id . ' — ' . $e->getMessage());
+                    }
+                }
+
+                if (!empty($rows)) {
+                    try {
+                        Newcustomerapplication::insertOrIgnore($rows);
+                        $counter += count($rows);
+                        $this->info('Inserted ' . count($rows) . ' applications. Total so far: ' . $counter);
+                    } catch (\Exception $e) {
+                        $this->error('Bulk insert failed, falling back row-by-row: ' . $e->getMessage());
+                        foreach ($rows as $row) {
+                            try {
+                                Newcustomerapplication::insertOrIgnore([$row]);
+                                $counter++;
+                            } catch (\Exception $ex) {
+                                $this->error('Failed Application ID ' . $row['id'] . ': ' . $ex->getMessage());
+                            }
+                        }
+                    }
+                }
+            }, 'Id');
+
+        $this->info('Total Imported Applications: ' . $counter);
     }
 
  // ✅ Clean C# DateTime.MinValue

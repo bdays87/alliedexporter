@@ -28,53 +28,108 @@ class ImportRegistrations extends Command
      */
     public function handle()
     {
-        $registrations = Registration::with("profession")->get();
-        foreach ($registrations as $registration) {
-            // Check if registration already exists
-            $existingRegistration = \App\Models\Newcustomerregistration::where('id', $registration->Id)->first();
-            if ($existingRegistration) {
-                $this->info('Registration ' . $registration->Id . ' already exists. Skipping...');
-                continue;
-            }
+        $chunkSize = 500;
 
-            $checkcustomer = Newcustomer::where('id', $registration->CustomerId)->first();
-            if ($checkcustomer) {
-                $checkprofession = \App\Models\Newprofession::where('name', $registration->profession->Description)->where("prefix", $registration->profession->Prefix)->first();
-                if ($checkprofession) {
-                    $checkcustomerprofession = \App\Models\Newcustomerprofession::where('customer_id', $registration->CustomerId)->where('profession_id', $checkprofession->id)->first();
-                    if ($checkcustomerprofession) {
-                        $regdate = $this->parseDate($registration->RegistrationDate);
-                        $newcustomerregistration = new \App\Models\Newcustomerregistration();
-                        $newcustomerregistration->id = $registration->Id;
-                        $newcustomerregistration->customer_id = $registration->CustomerId;
-                        $newcustomerregistration->customerprofession_id = $checkcustomerprofession->id;
-                        $newcustomerregistration->status = "APPROVED";
-                        $newcustomerregistration->certificatenumber = $registration->CertificateNumber;
-                        $newcustomerregistration->registrationdate = $regdate;
-                        $newcustomerregistration->year = Carbon::parse($regdate)->year;
+        // Pre-load all lookup tables into memory — eliminates per-row SELECT queries
+        $existingIds = \App\Models\Newcustomerregistration::pluck('id')->flip()->all();
 
-                           // Handle C# DateTimeOffset format and convert to Laravel timestamp
+        $existingCustomerIds = Newcustomer::pluck('id')->flip()->all();
+
+        // Keyed by id (= old Profession.Id, preserved during import) for direct O(1) lookup
+        $professions = \App\Models\Newprofession::all()->keyBy('id');
+
+        // Keyed by customer_id|profession_id for direct lookup
+        $customerprofessions = \App\Models\Newcustomerprofession::all()
+            ->keyBy(fn($cp) => $cp->customer_id . '|' . $cp->profession_id);
+
+        $total = Registration::count();
+        $this->info('Total Registrations Found: ' . $total);
+
+        $counter = 0;
+
+        Registration::with('profession')
+            ->chunkById($chunkSize, function ($registrations) use (
+                &$counter, &$existingIds, $existingCustomerIds, $professions, $customerprofessions
+            ) {
+                $rows = [];
+
+                foreach ($registrations as $registration) {
+                    $id = $registration->Id;
+
+                    try {
+                        if (isset($existingIds[$id])) {
+                            continue;
+                        }
+
+                        if (!isset($existingCustomerIds[$registration->CustomerId])) {
+                            $this->error('Customer not found for Registration ID: ' . $id . ' Customer ID: ' . $registration->CustomerId);
+                            continue;
+                        }
+
+                        // Use ProfessionId directly — Newprofession.id = old Profession.Id (preserved during import)
+                        $checkprofession = $professions->get($registration->ProfessionId);
+
+                        if (!$checkprofession) {
+                            $this->error('Profession not found for Registration ID: ' . $id . ' ProfessionId: ' . $registration->ProfessionId);
+                            continue;
+                        }
+
+                        // Look up by customer_id|profession_id using the registration's own ProfessionId
+                        $cpKey                   = $registration->CustomerId . '|' . $registration->ProfessionId;
+                        $this->line('Looking up cpKey: ' . $cpKey);
+
+                        $checkcustomerprofession = $customerprofessions->get($cpKey);
+
+                        if (!$checkcustomerprofession) {
+                            $this->error('Customer Profession not found for Registration ID: ' . $id . ' Customer ID: ' . $registration->CustomerId . ' ProfessionId: ' . $registration->ProfessionId);
+                            continue;
+                        }
+
+                        $regdate     = $this->parseDate($registration->RegistrationDate);
                         $dateCreated = $this->parseDateTimeOffset($registration->DateCreated);
-                        // If DateCreated is DateTime.MinValue, try to use DateUpdated instead
-                        if (! $dateCreated) {
+                        if (!$dateCreated) {
                             $dateCreated = $this->parseDateTimeOffset($registration->DateUpdated);
                         }
-                        $newcustomerregistration->created_at = $dateCreated ?? now();
-                        $newcustomerregistration->updated_at = $this->parseDateTimeOffset($registration->DateUpdated);
-                        $newcustomerregistration->save();
 
-                        $this->info('Imported Registration ID: ' . $registration->Id . ' for Customer ID: ' . $registration->CustomerId);
-                    } else {
-                        $this->error('Customer Profession not found for Registration ID: ' . $registration->Id . ' and Customer ID: ' . $registration->CustomerId);
+                        $rows[] = [
+                            'id'                    => $id,
+                            'customer_id'           => $registration->CustomerId,
+                            'customerprofession_id' => $checkcustomerprofession->id,
+                            'status'                => 'APPROVED',
+                            'certificatenumber'     => $registration->CertificateNumber,
+                            'registrationdate'      => $regdate,
+                            'year'                  => $regdate ? Carbon::parse($regdate)->year : null,
+                            'created_at'            => $dateCreated ?? now(),
+                            'updated_at'            => $this->parseDateTimeOffset($registration->DateUpdated),
+                        ];
+
+                        $existingIds[$id] = true;
+
+                    } catch (\Exception $e) {
+                        $this->error('Error processing Registration ID: ' . $id . ' — ' . $e->getMessage());
                     }
-                } else {
-                    $this->error('Profession not found for Registration ID: ' . $registration->Id . ' and Profession ID: ' . $registration->ProfessionId);
                 }
-            } else {
-                $this->error('Customer not found for Registration ID: ' . $registration->Id . ' and Customer ID: ' . $registration->CustomerId);
-            }
-            //$this->info('Imported Registration: ' . $registration->Id);
-        }
+
+                if (!empty($rows)) {
+                    try {
+                        \App\Models\Newcustomerregistration::insertOrIgnore($rows);
+                        $counter += count($rows);
+                        $this->info('Inserted ' . count($rows) . ' registrations. Total so far: ' . $counter);
+                    } catch (\Exception $e) {
+                        $this->error('Bulk insert failed, falling back row-by-row: ' . $e->getMessage());
+                        foreach ($rows as $row) {
+                            try {
+                                \App\Models\Newcustomerregistration::insertOrIgnore([$row]);
+                                $counter++;
+                            } catch (\Exception $ex) {
+                                $this->error('Failed Registration ID ' . $row['id'] . ': ' . $ex->getMessage());
+                            }
+                        }
+                    }
+                }
+            }, 'Id');
+
+        $this->info('Total Imported Registrations: ' . $counter);
     }
 
 

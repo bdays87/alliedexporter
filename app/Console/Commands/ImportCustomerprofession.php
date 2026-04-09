@@ -33,81 +33,116 @@ class ImportCustomerprofession extends Command
      */
     public function handle()
     {
-        $customerprofessions = Customerprofession::with('customer.registrations', 'profession', 'customerapplications')->get();
-        $this->info('Total Customer Profession: ' . $customerprofessions->count());
+        $chunkSize = 500;
+
+        // Pre-load all lookup tables into memory — zero per-row queries for these
+        $registertypes   = Newregistertype::all();
+        $professions     = Newprofession::all();
+        $professionTires = ProfessionTire::all()->keyBy('ProfessionId');
+
+        // Pre-load existing IDs — eliminates one SELECT per row
+        $existingIds = Newcustomerprofession::pluck('id')->flip()->all();
+
+        $total = Customerprofession::count();
+        $this->info('Total Customer Professions: ' . $total);
+
         $counter = 0;
-        $registertypes = Newregistertype::all();
-        $professions = Newprofession::all();
-        foreach ($customerprofessions as $customerprofession) {
-            $id = $customerprofession->Id;
 
-            // Check if customer profession already exists
-            $existingCustomerProfession = Newcustomerprofession::where('id', $id)->first();
-            if ($existingCustomerProfession) {
-                $this->info('Customer Profession ' . $id . ' already exists. Skipping...');
-                continue;
-            }
+        Customerprofession::with('customer.registrations', 'profession')
+            ->chunkById($chunkSize, function ($customerprofessions) use (
+                &$counter, &$existingIds, $registertypes, $professions, $professionTires
+            ) {
+                $rows = [];
 
+                foreach ($customerprofessions as $customerprofession) {
+                    $id = $customerprofession->Id;
 
-            $profession = $professions->where('name', $customerprofession->profession->Description)->where("prefix", $customerprofession->profession->Prefix)->first();
-            if ($profession) {
-                if (!$customerprofession->customer) {
-                    $this->error('Customer not found for Customer Profession ID: ' . $customerprofession->Id . ' and Customer ID: ' . $customerprofession->CustomerId);
-                    continue;
+                    try {
+                        if (isset($existingIds[$id])) {
+                            continue;
+                        }
+
+                        if (!$customerprofession->profession) {
+                            $this->error('Profession relation missing for Customer Profession ID: ' . $id);
+                            continue;
+                        }
+
+                        $profession = $professions
+                            ->where('name', $customerprofession->profession->Name)
+                            ->where('prefix', $customerprofession->profession->Prefix)
+                            ->first();
+
+                        if (!$profession) {
+                            $this->error('Profession not found for Customer Profession ID: ' . $id . ' — ' . $customerprofession->profession->Description . ' / ' . $customerprofession->profession->Prefix);
+                            continue;
+                        }
+
+                        if (!$customerprofession->customer) {
+                            $this->error('Customer not found for Customer Profession ID: ' . $id . ' Customer ID: ' . $customerprofession->CustomerId);
+                            continue;
+                        }
+
+                        $registertype = $registertypes->where('name', $customerprofession->customer->RegisterName)->first();
+
+                        // Use the eager-loaded collection (->registrations) not a new DB query (->registrations())
+                        $registration = $customerprofession->customer->registrations
+                            ->where('ProfessionId', $customerprofession->ProfessionId)
+                            ->first();
+
+                        // Use the pre-loaded tire map instead of one query per row
+                        $tire    = $professionTires->get($customerprofession->ProfessionId);
+                        $tire_id = $tire ? $tire->RenewalTireId : null;
+
+                        $dateCreated = $this->parseDateTimeOffset($customerprofession->DateCreated);
+                        if (!$dateCreated) {
+                            $dateCreated = $this->parseDateTimeOffset($customerprofession->DateUpdated);
+                        }
+
+                        $rows[] = [
+                            'id'                    => $id,
+                            'customer_id'           => $customerprofession->CustomerId,
+                            'profession_id'         => $profession->id,
+                            'customertype_id'       => $customerprofession->customer->CustomerTypeId != 1 ? 3 : 1,
+                            'employmentstatus_id'   => $customerprofession->customer->EmploymentStatusId,
+                            'employmentlocation_id' => $customerprofession->customer->EmploymentLocationId,
+                            'registertype_id'       => $registertype ? $registertype->id : null,
+                            'registrationnumber'    => $customerprofession->customer->Prefix . $customerprofession->customer->RegistrationNumber,
+                            'tire_id'               => $tire_id,
+                            'uuid'                  => Str::uuid()->toString(),
+                            'employmentsector'      => 'PUBLIC',
+                            'status'                => 'APPROVED',
+                            'year'                  => $registration ? Carbon::parse($registration->RegistrationDate)->year : null,
+                            'created_at'            => $dateCreated ?? now(),
+                            'updated_at'            => $this->parseDateTimeOffset($customerprofession->DateUpdated),
+                        ];
+
+                        $existingIds[$id] = true;
+
+                    } catch (\Exception $e) {
+                        $this->error('Error processing Customer Profession ID: ' . $id . ' — ' . $e->getMessage());
+                    }
                 }
-                $registertype = $registertypes->where('name', $customerprofession->customer->RegisterName)->first();
-                $registration = $customerprofession->customer->registrations()->where('ProfessionId', $customerprofession->ProfessionId)->first();
 
+                if (!empty($rows)) {
+                    try {
+                        Newcustomerprofession::insertOrIgnore($rows);
+                        $counter += count($rows);
+                        $this->info('Inserted ' . count($rows) . ' records. Total so far: ' . $counter);
+                    } catch (\Exception $e) {
+                        $this->error('Bulk insert failed, falling back row-by-row: ' . $e->getMessage());
+                        foreach ($rows as $row) {
+                            try {
+                                Newcustomerprofession::insertOrIgnore([$row]);
+                                $counter++;
+                            } catch (\Exception $ex) {
+                                $this->error('Failed Customer Profession ID ' . $row['id'] . ': ' . $ex->getMessage());
+                            }
+                        }
+                    }
+                }
+            }, 'Id');
 
-                $tire_id;
-                $existingProfessiontire = ProfessionTire::with('renewaltire')->where('ProfessionId', $customerprofession->ProfessionId)->first();
-
-                if ($existingProfessiontire !=null) {
-                      $tire_id=$existingProfessiontire->RenewalTireId;
-                   }
-                $customer_id = $customerprofession->CustomerId;
-                $profession_id = $profession->id;
-                $customertype_id = $customerprofession->customer->CustomerTypeId != 1 ? 3 : 1;
-                $employmentstatus_id = $customerprofession->customer->EmploymentStatusId;
-                $employmentlocation_id = $customerprofession->customer->EmploymentLocationId;
-                $registertype_id = $registertype ? $registertype->id : null;
-                $registrationnumber = $customerprofession->customer->Prefix . $customerprofession->customer->RegistrationNumber;
-                // $tire_id = 1;
-                $uuid = Str::uuid()->toString();
-                $employmentsector = "PUBLIC";
-                $status = "APPROVED";
-                $year =  $registration ? Carbon::parse($registration->RegistrationDate)->year : null;
-                $newcustomerprofession = new Newcustomerprofession();
-                $newcustomerprofession->id = $id;
-                $newcustomerprofession->customer_id = $customer_id;
-                $newcustomerprofession->profession_id = $profession_id;
-                $newcustomerprofession->customertype_id = $customertype_id;
-                $newcustomerprofession->employmentstatus_id = $employmentstatus_id;
-                $newcustomerprofession->employmentlocation_id = $employmentlocation_id;
-                $newcustomerprofession->registertype_id = $registertype_id;
-                $newcustomerprofession->registrationnumber = $registrationnumber;
-                $newcustomerprofession->tire_id = $tire_id;
-                $newcustomerprofession->uuid = $uuid;
-                $newcustomerprofession->employmentsector = $employmentsector;
-                $newcustomerprofession->status = $status;
-                $newcustomerprofession->year = $year;
-
-                // Handle C# DateTimeOffset format and convert to Laravel timestamp
-            $dateCreated = $this->parseDateTimeOffset($customerprofession->DateCreated);
-            // If DateCreated is DateTime.MinValue, try to use DateUpdated instead
-            if (! $dateCreated) {
-                $dateCreated = $this->parseDateTimeOffset($customerprofession->DateUpdated);
-            }
-            $newcustomerprofession->created_at = $dateCreated ?? now();
-            $newcustomerprofession->updated_at = $this->parseDateTimeOffset($customerprofession->DateUpdated);
-                $newcustomerprofession->save();
-                $counter++;
-            } else {
-                $this->error('Profession not found for Customer Profession ID: ' . $customerprofession->ProfessionId . ' and Profession Description: ' . $customerprofession->profession->Description . ' and Profession Prefix: ' . $customerprofession->profession->Prefix);
-            }
-            //$this->info('Imported Customer Profession: ' . $counter);
-        }
-        $this->info('Total Imported Customer Profession: ' . $counter);
+        $this->info('Total Imported Customer Professions: ' . $counter);
     }
 
 

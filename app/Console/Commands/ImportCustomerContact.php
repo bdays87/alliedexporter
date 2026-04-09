@@ -42,29 +42,33 @@ class ImportCustomerContact extends Command
          $this->info('Total Customer Contacts Found: '.$oldcustomercontacts->count());
         $counter = 0;
         foreach ($oldcustomercontacts as $student) {
+            try {
+                // Check if student already exists by ID
+                $existingStudent = NewCustomerContact::where('id', $student->Id)->first();
+                if ($existingStudent) {
+                    $this->info('Customer Contact ' . $student->Id . ' already exists. Skipping...');
+                    continue;
+                }
 
-         // Check if student already exists by ID
-            $existingStudent = NewCustomerContact::where('id', $student->Id)->first();
-            if ($existingStudent) {
-                $this->info('Customer Contact ' . $student->Id . ' already exists. Skipping...');
-                continue;
+                $new = new NewCustomerContact;
+                $new->id = $student->Id;
+                $new->customer_id = $student->CustomerId;
+                $new->name = null;
+                $new->relationship = null;
+                $new->primaryphone = $student->PrimaryPhone;
+                $new->secondaryphone = $student->SecondaryPhone;
+                $new->email = $student->Email;
+                $new->created_at = now();
+                $new->updated_at = now();
+
+                $new->save();
+
+                $counter++;
+                $customerName = $student->customer ? $student->customer->fullname : 'Customer ID ' . $student->CustomerId;
+                $this->info("Customer Contact {$counter} imported: {$customerName}");
+            } catch (\Exception $e) {
+                $this->error('Error processing Customer Contact ID: ' . $student->Id . ' — ' . $e->getMessage());
             }
-
-            $new = new NewCustomerContact;
-            $new->id = $student->Id;
-            $new->customer_id = $student->CustomerId;
-            $new->name = null;
-            $new->relationship = null;
-            $new->primaryphone = $student->PrimaryPhone;
-            $new->secondaryphone = $student->SecondaryPhone;
-            $new->email = $student->Email;
-            $new->created_at = now();
-            $new->updated_at =  now();
-
-            $new->save();
-
-              $counter++;
-            $this->info("Customer Contact {$counter} imported: {$student->customer->fullname}");
         }
     }
 
